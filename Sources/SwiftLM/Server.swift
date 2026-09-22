@@ -1851,6 +1851,7 @@ func handleChatCompletion(
 
     // ── Acquire slot (concurrency limiter) ──
     await semaphore.wait()
+    let slot = GenerationSlot(semaphore: semaphore)
     await stats.requestStarted()
     let genStart = Date()
 
@@ -1923,6 +1924,15 @@ func handleChatCompletion(
     fflush(stdout)
     let prefillStart = Date()
 
+    let modelId = config.modelId
+
+    // ── Generation start (deferred for streaming) ──
+    // For streaming responses this closure runs inside the SSE consumer task
+    // AFTER the response headers are on the wire, so a long prefill cannot
+    // leave the client staring at a silent connection (client idle-timeout →
+    // ECONNRESET → retry with an ever-grown payload). Non-streaming awaits it
+    // inline, exactly as before. (Body indentation intentionally unchanged.)
+    let startGeneration: () async throws -> (AsyncStream<Generation>, (() async -> Void)?) = {
     // ── DFlash block-diffusion speculative decoding ──
     // When --dflash is enabled and both DFlash draft model and target model conform
     // to DFlashTargetModel, we use DFlashRuntime.generate instead of the standard path.
@@ -1966,24 +1976,7 @@ func handleChatCompletion(
             }
         }
 
-        let modelId = config.modelId
-        if isStream {
-            return handleChatStreaming(
-                stream: genStream, modelId: modelId, stopSequences: stopSequences,
-                includeUsage: includeUsage, promptTokenCount: promptTokenCount,
-                enableThinking: enableThinking, thinkingPreOpened: thinkingPreOpened,
-                jsonMode: jsonMode, semaphore: semaphore,
-                stats: stats, genStart: genStart, prefillStart: prefillStart,
-                emitPrefillProgress: false, onPrefillDone: nil
-            )
-        } else {
-            return try await handleChatNonStreaming(
-                stream: genStream, modelId: modelId, stopSequences: stopSequences,
-                promptTokenCount: promptTokenCount, enableThinking: enableThinking,
-                thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, semaphore: semaphore,
-                stats: stats, genStart: genStart, prefillStart: prefillStart, onPrefillDone: nil
-            )
-        }
+        return (genStream, nil)
     }
 
     // ── Cache-aware generation (standard path) ──
@@ -2091,23 +2084,24 @@ func handleChatCompletion(
         }
         return (stream, onPrefillDone)
     }
-
-    let modelId = config.modelId
+        return (stream, onPrefillDone)
+    }  // end startGeneration
 
     if isStream {
         return handleChatStreaming(
-            stream: stream, modelId: modelId, stopSequences: stopSequences,
+            startGeneration: startGeneration, modelId: modelId, stopSequences: stopSequences,
             includeUsage: includeUsage, promptTokenCount: promptTokenCount,
             enableThinking: enableThinking, thinkingPreOpened: thinkingPreOpened,
-            jsonMode: jsonMode, semaphore: semaphore,
+            jsonMode: jsonMode, slot: slot,
             stats: stats, genStart: genStart, prefillStart: prefillStart,
-            emitPrefillProgress: emitPrefillProgress, onPrefillDone: onPrefillDone
+            emitPrefillProgress: emitPrefillProgress
         )
     } else {
+        let (stream, onPrefillDone) = try await startGeneration()
         return try await handleChatNonStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
             promptTokenCount: promptTokenCount, enableThinking: enableThinking,
-            thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, semaphore: semaphore,
+            thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, slot: slot,
             stats: stats, genStart: genStart, prefillStart: prefillStart, onPrefillDone: onPrefillDone
         )
     }
@@ -2249,7 +2243,7 @@ actor PrefillState {
 }
 
 func handleChatStreaming(
-    stream: AsyncStream<Generation>,
+    startGeneration: @escaping () async throws -> (AsyncStream<Generation>, (() async -> Void)?),
     modelId: String,
     stopSequences: [String],
     includeUsage: Bool,
@@ -2257,12 +2251,11 @@ func handleChatStreaming(
     enableThinking: Bool = false,
     thinkingPreOpened: Bool = false,
     jsonMode: Bool = false,
-    semaphore: AsyncSemaphore,
+    slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date,
     prefillStart: Date,
-    emitPrefillProgress: Bool,
-    onPrefillDone: (() async -> Void)? = nil
+    emitPrefillProgress: Bool
 ) -> Response {
     let (sseStream, cont) = AsyncStream<String>.makeStream()
 
@@ -2271,7 +2264,9 @@ func handleChatStreaming(
     // We capture the hook in a local variable so that concurrent requests
     // cannot clobber each other's hook via the global. The global is still
     // written here because LLMModel.prepare() reads it, but the semaphore
-    // ensures only one generation runs at a time.
+    // ensures only one generation runs at a time. Installed BEFORE the
+    // response is returned: startGeneration (prefill) runs inside the
+    // consumer task below, so the hook is live for the whole prefill.
     var heartbeatTask: Task<Void, Never>? = nil
     activePrefillProgressHook = nil
     if emitPrefillProgress {
@@ -2298,7 +2293,12 @@ func handleChatStreaming(
         }
     }
 
-    Task {
+    // First byte on the wire before any model work: proves connection
+    // liveness so a long prefill cannot trip the client's idle timeout
+    // (e.g. Bun fetch's 10s) into an ECONNRESET-and-retry loop.
+    cont.yield(": connected\r\n\r\n")
+
+    let consumerTask: Task<Void, Never> = Task {
         var hasToolCalls = false
         var toolCallIndex = 0
         var completionTokenCount = 0
@@ -2315,14 +2315,32 @@ func handleChatStreaming(
         // arriving in a later chunk merges with the previous one.
         var emittedTextCount = 0
         var heldStopTail = ""
-        // Unconditional cleanup: guarantees heartbeat is cancelled on ALL exit paths
-        // (normal completion, client disconnect, or task cancellation during prefill).
+        // Unconditional cleanup: guarantees heartbeat is cancelled and the
+        // generation slot is returned on ALL exit paths (normal completion,
+        // startGeneration failure, client disconnect, or task cancellation).
         defer {
             heartbeatTask?.cancel()
             heartbeatTask = nil
             activePrefillProgressHook = nil
+            slot.release()
         }
-        
+
+        // Start generation only now — the response headers are already on the
+        // wire, so even a multi-second prefill leaves an idle-timeout-free
+        // connection (heartbeat chunks flow if the client opted in).
+        let generation: (stream: AsyncStream<Generation>, onPrefillDone: (() async -> Void)?)
+        do {
+            generation = try await startGeneration()
+        } catch {
+            let errMsg = String(describing: error).replacingOccurrences(of: "\"", with: "'")
+            _ = cont.yield("data: {\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}\r\n\r\n")
+            _ = cont.yield("data: [DONE]\r\n\r\n")
+            cont.finish()
+            return
+        }
+        let stream = generation.stream
+        let onPrefillDone = generation.onPrefillDone
+
         // ── JSON mode streaming: buffer early tokens to strip hallucinated prefixes ──
         var jsonBuffering = jsonMode
         var jsonBuffer = ""
@@ -2554,8 +2572,11 @@ func handleChatStreaming(
         cont.finish()
         let duration = Date().timeIntervalSince(genStart)
         await stats.requestFinished(tokens: completionTokenCount, duration: duration)
-        await semaphore.signal()
     }
+    // If the client disconnects, Hummingbird tears down the response body,
+    // terminating sseStream — cancel the consumer so the generation loop stops
+    // and the defer above returns the slot instead of finishing a dead download.
+    cont.onTermination = { _ in consumerTask.cancel() }
     return Response(
         status: .ok,
         headers: sseHeaders(),
@@ -2573,7 +2594,7 @@ func handleChatNonStreaming(
     enableThinking: Bool = false,
     thinkingPreOpened: Bool = false,
     jsonMode: Bool = false,
-    semaphore: AsyncSemaphore,
+    slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date,
     prefillStart: Date,
@@ -2623,7 +2644,7 @@ func handleChatNonStreaming(
     print("srv  slot done: id 0 | gen_tokens=\(completionTokenCount) | OS_RAM=\(String(format: "%.1f", postMemSnap.os))GB | MEM_DEMAND=\(String(format: "%.1f", postMemSnap.demand))GB | GPU_MEM=\(String(format: "%.1f", postMemSnap.gpu))GB")
     let duration = Date().timeIntervalSince(genStart)
     await stats.requestFinished(tokens: completionTokenCount, duration: duration)
-    await semaphore.signal()
+    slot.release()
 
     // ── Apply stop sequences to final text ──
     var finishReason: String
@@ -2776,6 +2797,7 @@ func handleTextCompletion(
     }
 
     await semaphore.wait()
+    let slot = GenerationSlot(semaphore: semaphore)
     await stats.requestStarted()
     let genStart = Date()
 
@@ -2785,19 +2807,23 @@ func handleTextCompletion(
     // ── Get actual prompt token count before generate() to avoid data race ──
     let promptTokenCount = lmInput.text.tokens.size
 
-    let stream = try await container.generate(input: lmInput, parameters: params)
     let modelId = config.modelId
 
     if isStream {
+        // Deferred: container.generate runs prefill; inside the consumer task it
+        // happens AFTER the response headers are on the wire (same rationale as
+        // the chat path — no silent-prefill idle timeout).
         return handleTextStreaming(
-            stream: stream, modelId: modelId, stopSequences: stopSequences,
-            promptTokenCount: promptTokenCount, semaphore: semaphore, stats: stats,
+            startGeneration: { try await container.generate(input: lmInput, parameters: params) },
+            modelId: modelId, stopSequences: stopSequences,
+            promptTokenCount: promptTokenCount, slot: slot, stats: stats,
             genStart: genStart, emitPrefillProgress: emitPrefillProgress
         )
     } else {
+        let stream = try await container.generate(input: lmInput, parameters: params)
         return try await handleTextNonStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
-            promptTokenCount: promptTokenCount, semaphore: semaphore, stats: stats, genStart: genStart
+            promptTokenCount: promptTokenCount, slot: slot, stats: stats, genStart: genStart
         )
     }
 }
@@ -2805,11 +2831,11 @@ func handleTextCompletion(
 // ── Text Streaming ───────────────────────────────────────────────────────────
 
 func handleTextStreaming(
-    stream: AsyncStream<Generation>,
+    startGeneration: @escaping () async throws -> AsyncStream<Generation>,
     modelId: String,
     stopSequences: [String],
     promptTokenCount: Int,
-    semaphore: AsyncSemaphore,
+    slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date,
     emitPrefillProgress: Bool
@@ -2838,7 +2864,9 @@ func handleTextStreaming(
             }
         }
     }
-    Task {
+    // First byte before any model work — same liveness guarantee as the chat path.
+    cont.yield(": connected\r\n\r\n")
+    let consumerTask: Task<Void, Never> = Task {
         var completionTokenCount = 0
         var fullText = ""
         var stopped = false
@@ -2847,12 +2875,23 @@ func handleTextStreaming(
         // a stop sequence (#133). Local to this loop; the chat path has its own pair.
         var emittedTextCount = 0
         var heldStopTail = ""
-        // Unconditional cleanup: guarantees heartbeat is cancelled on ALL exit paths
-        // (normal completion, client disconnect, or task cancellation during prefill).
+        // Unconditional cleanup: cancels the heartbeat and returns the generation
+        // slot on ALL exit paths (completion, startGeneration failure, disconnect).
         defer {
             heartbeatTask?.cancel()
             heartbeatTask = nil
             activePrefillProgressHook = nil
+            slot.release()
+        }
+        let stream: AsyncStream<Generation>
+        do {
+            stream = try await startGeneration()
+        } catch {
+            let errMsg = String(describing: error).replacingOccurrences(of: "\"", with: "'")
+            _ = cont.yield("data: {\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}\r\n\r\n")
+            _ = cont.yield("data: [DONE]\n\n")
+            cont.finish()
+            return
         }
         for await generation in stream {
             if stopped { break }
@@ -2931,8 +2970,8 @@ func handleTextStreaming(
         cont.finish()
         let duration = Date().timeIntervalSince(genStart)
         await stats.requestFinished(tokens: completionTokenCount, duration: duration)
-        await semaphore.signal()
     }
+    cont.onTermination = { _ in consumerTask.cancel() }
     return Response(
         status: .ok,
         headers: sseHeaders(),
@@ -2947,7 +2986,7 @@ func handleTextNonStreaming(
     modelId: String,
     stopSequences: [String],
     promptTokenCount: Int,
-    semaphore: AsyncSemaphore,
+    slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date
 ) async throws -> Response {
@@ -2968,7 +3007,7 @@ func handleTextNonStreaming(
     }
     let duration = Date().timeIntervalSince(genStart)
     await stats.requestFinished(tokens: completionTokenCount, duration: duration)
-    await semaphore.signal()
+    slot.release()
 
     var finishReason = "stop"
     if let (trimmedText, _) = checkStopSequences(fullText, stopSequences: stopSequences) {
@@ -3029,6 +3068,41 @@ actor AsyncSemaphore {
             let waiter = waiters.removeFirst()
             waiter.resume()
         }
+    }
+}
+
+/// Holds one slot acquired from ``AsyncSemaphore`` and guarantees it is
+/// released exactly once — whichever of an explicit `release()` or `deinit`
+/// fires first.
+///
+/// Without this, any `throw` after `semaphore.wait()` (e.g. `container.prepare`
+/// or `container.perform` failing) skipped every `signal()` call site and
+/// permanently leaked the slot; with the default `--parallel 1` a single failed
+/// request wedged the server for all subsequent generations until restart.
+final class GenerationSlot: @unchecked Sendable {
+    private let semaphore: AsyncSemaphore
+    private let lock = NSLock()
+    private var released = false
+
+    init(semaphore: AsyncSemaphore) {
+        self.semaphore = semaphore
+    }
+
+    func release() {
+        lock.lock()
+        let first = !released
+        released = true
+        lock.unlock()
+        guard first else { return }
+        // Bind locally: a closure that touches `self.semaphore` would capture
+        // `self`, which the runtime rejects (dangling ref) when this is called
+        // from `deinit`.
+        let sem = semaphore
+        Task { await sem.signal() }
+    }
+
+    deinit {
+        release()
     }
 }
 
