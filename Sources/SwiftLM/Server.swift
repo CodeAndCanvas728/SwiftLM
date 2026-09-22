@@ -182,8 +182,15 @@ private struct TransformersTokenizerBridge: MLXLMCommon.Tokenizer, Sendable {
         additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
         do {
+            // Issue #168: JSON `null` in tool schemas decodes to NSNull via AnyCodable.
+            // swift-jinja's Value.init(any:) has no NSNull case, so a single null anywhere
+            // in a tool spec aborted the whole render with a misleading "Optional<Any>"
+            // conversion error that was then mislabeled as a broken template. Strip nulls
+            // (and unwrap nested optionals) before handing anything to the template engine.
             return try upstream.applyChatTemplate(
-                messages: messages, tools: tools, additionalContext: additionalContext)
+                messages: messages.map { $0.mapValuesDeep(sanitizeForJinja) },
+                tools: tools?.map { $0.mapValuesDeep(sanitizeForJinja) },
+                additionalContext: additionalContext.map { $0.mapValuesDeep(sanitizeForJinja) })
         } catch Tokenizers.TokenizerError.missingChatTemplate {
             throw MLXLMCommon.TokenizerError.missingChatTemplate
         } catch {
@@ -193,6 +200,42 @@ private struct TransformersTokenizerBridge: MLXLMCommon.Tokenizer, Sendable {
             throw MalformedChatTemplate(
                 modelId: modelId, underlying: String(describing: error))
         }
+    }
+}
+
+/// Returns `nil` when the value must be dropped (JSON `null` / NSNull), otherwise a
+/// structure with every nested null removed. See `TransformersTokenizerBridge.applyChatTemplate`.
+func sanitizeForJinja(_ value: any Sendable) -> any Sendable? {
+    if value is NSNull { return nil }
+    let mirror = Mirror(reflecting: value)
+    if mirror.displayStyle == .optional {
+        guard let child = mirror.children.first else { return nil }
+        return sanitizeForJinja(child.value as any Sendable)
+    }
+    if let dict = value as? [String: Any] {
+        var out: [String: any Sendable] = [:]
+        for (key, val) in dict {
+            if let cleaned = sanitizeForJinja(val as any Sendable) {
+                out[key] = cleaned
+            }
+        }
+        return out
+    }
+    if let arr = value as? [Any] {
+        return arr.compactMap { sanitizeForJinja($0 as any Sendable) }
+    }
+    return value
+}
+
+extension Dictionary where Key == String, Value == any Sendable {
+    func mapValuesDeep(_ transform: (any Sendable) -> any Sendable?) -> [String: any Sendable] {
+        var out: [String: any Sendable] = [:]
+        for (key, val) in self {
+            if let cleaned = transform(val) {
+                out[key] = cleaned
+            }
+        }
+        return out
     }
 }
 
@@ -1113,6 +1156,37 @@ struct MLXServer: AsyncParsableCommand {
         } catch {
             // Missing template, or a template that needs context this probe does not
             // supply. Neither is a reason to refuse to start.
+        }
+
+        // Issue #168: render once more with a minimal non-empty tools array. The probe
+        // above uses `tools: nil`, so a checkpoint whose template (or tool payload)
+        // breaks only under the tools branch loaded clean and then failed every real
+        // agentic request. Warn rather than abort: a tools-broken model still serves
+        // plain chat and /v1/completions.
+        do {
+            let probeTokenizer = await container.tokenizer
+            let probeTool: [String: any Sendable] = [
+                "type": "function",
+                "function": [
+                    "name": "probe",
+                    "description": "startup chat-template tools probe",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "query": ["type": "string", "default": NSNull() as any Sendable]
+                        ],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+            _ = try probeTokenizer.applyChatTemplate(
+                messages: [["role": "user", "content": "ping"]],
+                tools: [probeTool],
+                additionalContext: ["add_generation_prompt": true]
+            )
+        } catch let error as MalformedChatTemplate {
+            print("[SwiftLM] ⚠️  chat-template tools probe failed (plain chat may still work): \(error.description)")
+        } catch {
+            // Same lenient pass as above: no template, or context the probe lacks.
         }
 
         print("[SwiftLM] Model loaded. Starting HTTP server on \(host):\(port)")
@@ -3161,8 +3235,7 @@ func sseChunk(modelId: String, reasoningContent: String?, content: String?, fini
 
 /// Prefill-progress heartbeat chunk — emitted every 2s while the server is processing the prompt
 /// when explicitly enabled via `X-SwiftLM-Prefill-Progress: true`.
-/// It is sent as a named SSE event (`event: prefill_progress`) to avoid breaking strict
-/// OpenAI-compatible clients (e.g. OpenCode), which reject unknown `data:` objects.
+/// It is sent as a named SSE event (`event: prefill_progress`).
 /// Format mirrors llama-server's slot_update event:
 ///   n_past          : tokens evaluated so far (real value from chunked prefill, or 0 for single-chunk)
 ///   n_prompt_tokens : total prompt token count
@@ -3170,6 +3243,9 @@ func sseChunk(modelId: String, reasoningContent: String?, content: String?, fini
 ///   elapsed_seconds : wall-clock time since the request started
 /// Note: `model` is intentionally omitted — clients can correlate from preceding stream chunks.
 /// Note: `on` is accepted as a truthy header value for parity with common reverse proxy conventions.
+/// Issue #168: `choices: []` is present so strict OpenAI chunk validators (opencode's
+/// ChatCompletionChunk union) accept the payload even when they parse every `data:` line
+/// regardless of `event:`. The named event alone was not enough.
 func ssePrefillChunk(nPast: Int = 0, promptTokens: Int, elapsedSeconds: Int) -> String {
     let fraction = promptTokens > 0 ? Double(nPast) / Double(promptTokens) : 0.0
     let chunk: [String: Any] = [
@@ -3177,7 +3253,8 @@ func ssePrefillChunk(nPast: Int = 0, promptTokens: Int, elapsedSeconds: Int) -> 
         "n_past": nPast,
         "n_prompt_tokens": promptTokens,
         "fraction": fraction,
-        "elapsed_seconds": elapsedSeconds
+        "elapsed_seconds": elapsedSeconds,
+        "choices": [Any]()
     ]
     let data = try! JSONSerialization.data(withJSONObject: chunk)
     return "event: prefill_progress\r\ndata: \(String(data: data, encoding: .utf8)!)\r\n\r\n"
