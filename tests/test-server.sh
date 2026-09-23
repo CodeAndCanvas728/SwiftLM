@@ -1161,12 +1161,13 @@ rm -f /tmp/mlx_inflight_models.json /tmp/mlx_inflight_health.json /tmp/mlx_infli
 # whole prefill inside container.perform before returning headers, so clients
 # saw no bytes for the entire prefill (Bun fetch 10s idle → ECONNRESET/retry).
 # A large prompt makes prefill multi-second; TTFB must stay well under that.
-# ponytail: ~7k tokens. Gemma-4 prefill allocates O(n²) attention in one Metal
-# buffer; the CI runner caps buffers at 3.5 GB (~15k tokens). 42k tokens
-# crashed the server with a 28 GB malloc.
+# ~2k tokens. Gemma-4 prefill allocates O(n²) attention in one Metal buffer
+# (~149 bytes × n² for gemma-4-e2b) and the CI runner caps a single buffer at
+# 3.5 GB, i.e. ~4.9k tokens max. 7k tokens crashed the server with a 7.4 GB
+# malloc; 2k tokens needs ~0.6 GB and still gives a measurable prefill.
 log "Test 38: streaming TTFB — ': connected' arrives before model prefill"
 
-python3 -c "print(' '.join(f'{i:06d}' for i in range(1000)))" > /tmp/mlx_ttfb_prompt.txt
+python3 -c "print(' '.join(f'{i:06d}' for i in range(300)))" > /tmp/mlx_ttfb_prompt.txt
 jq -nc --arg m "$MODEL" --rawfile p /tmp/mlx_ttfb_prompt.txt \
     '{model:$m, stream:true, max_tokens:5, messages:[{role:"user",content:("Summarize this list in one word:\n"+$p)}]}' \
     > /tmp/mlx_ttfb_body.json
