@@ -205,7 +205,7 @@ private struct TransformersTokenizerBridge: MLXLMCommon.Tokenizer, Sendable {
 
 /// Returns `nil` when the value must be dropped (JSON `null` / NSNull), otherwise a
 /// structure with every nested null removed. See `TransformersTokenizerBridge.applyChatTemplate`.
-func sanitizeForJinja(_ value: any Sendable) -> any Sendable? {
+func sanitizeForJinja(_ value: any Sendable) -> (any Sendable)? {
     if value is NSNull { return nil }
     let mirror = Mirror(reflecting: value)
     if mirror.displayStyle == .optional {
@@ -228,7 +228,7 @@ func sanitizeForJinja(_ value: any Sendable) -> any Sendable? {
 }
 
 extension Dictionary where Key == String, Value == any Sendable {
-    func mapValuesDeep(_ transform: (any Sendable) -> any Sendable?) -> [String: any Sendable] {
+    func mapValuesDeep(_ transform: (any Sendable) -> (any Sendable)?) -> [String: any Sendable] {
         var out: [String: any Sendable] = [:]
         for (key, val) in self {
             if let cleaned = transform(val) {
@@ -2332,8 +2332,7 @@ func handleChatStreaming(
         do {
             generation = try await startGeneration()
         } catch {
-            let errMsg = String(describing: error).replacingOccurrences(of: "\"", with: "'")
-            _ = cont.yield("data: {\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}\r\n\r\n")
+            _ = cont.yield(sseErrorChunk(error))
             _ = cont.yield("data: [DONE]\r\n\r\n")
             cont.finish()
             return
@@ -2887,8 +2886,7 @@ func handleTextStreaming(
         do {
             stream = try await startGeneration()
         } catch {
-            let errMsg = String(describing: error).replacingOccurrences(of: "\"", with: "'")
-            _ = cont.yield("data: {\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}\r\n\r\n")
+            _ = cont.yield(sseErrorChunk(error))
             _ = cont.yield("data: [DONE]\n\n")
             cont.finish()
             return
@@ -3271,6 +3269,23 @@ func sseHeaders() -> HTTPFields {
         HTTPField(name: .cacheControl, value: "no-cache"),
         HTTPField(name: HTTPField.Name("X-Accel-Buffering")!, value: "no"),
     ])
+}
+
+/// Build an OpenAI-style SSE `error` event for a failure after the stream's
+/// headers are already sent (the client sees HTTP 200). The message is
+/// JSON-encoded, so quotes, backslashes and newlines in it stay valid JSON.
+func sseErrorChunk(_ error: Error) -> String {
+    let payload: [String: Any] = ["error": [
+        "message": String(describing: error),
+        "type": "server_error",
+        "code": "internal_error",
+    ]]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload),
+          let json = String(data: data, encoding: .utf8)
+    else {
+        return "data: {\"error\":{\"message\":\"internal error\",\"type\":\"server_error\",\"code\":\"internal_error\"}}\r\n\r\n"
+    }
+    return "data: \(json)\r\n\r\n"
 }
 
 /// Build a chat.completion.chunk SSE event.

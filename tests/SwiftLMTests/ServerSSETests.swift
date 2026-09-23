@@ -139,4 +139,27 @@ final class ServerSSETests: XCTestCase {
         // is irrelevant to correctness. We capture the current contract here.
         // If a post-done guard is added later, add XCTAssertNotEqual(await state.nPast, 999).
     }
+
+    // MARK: - Error event stays valid JSON for any message text
+
+    private struct MessyError: Error, CustomStringConvertible {
+        let description = "bad \"quote\", back\\slash\nnew line"
+    }
+
+    func testErrorChunkEncodesMessageAsValidJSON() throws {
+        let chunk = sseErrorChunk(MessyError())
+
+        let prefix = "data: "
+        let suffix = "\r\n\r\n"
+        XCTAssertTrue(chunk.hasPrefix(prefix))
+        XCTAssertTrue(chunk.hasSuffix(suffix))
+
+        let payload = String(chunk.dropFirst(prefix.count).dropLast(suffix.count))
+        let obj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+        let err = try XCTUnwrap(obj["error"] as? [String: Any])
+        XCTAssertEqual(err["message"] as? String, MessyError().description)
+        XCTAssertEqual(err["type"] as? String, "server_error")
+        XCTAssertEqual(err["code"] as? String, "internal_error")
+    }
 }
