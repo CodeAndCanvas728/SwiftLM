@@ -182,8 +182,15 @@ private struct TransformersTokenizerBridge: MLXLMCommon.Tokenizer, Sendable {
         additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
         do {
+            // Issue #168: JSON `null` in tool schemas decodes to NSNull via AnyCodable.
+            // swift-jinja's Value.init(any:) has no NSNull case, so a single null anywhere
+            // in a tool spec aborted the whole render with a misleading "Optional<Any>"
+            // conversion error that was then mislabeled as a broken template. Strip nulls
+            // (and unwrap nested optionals) before handing anything to the template engine.
             return try upstream.applyChatTemplate(
-                messages: messages, tools: tools, additionalContext: additionalContext)
+                messages: messages.map { $0.mapValuesDeep(sanitizeForJinja) },
+                tools: tools?.map { $0.mapValuesDeep(sanitizeForJinja) },
+                additionalContext: additionalContext.map { $0.mapValuesDeep(sanitizeForJinja) })
         } catch Tokenizers.TokenizerError.missingChatTemplate {
             throw MLXLMCommon.TokenizerError.missingChatTemplate
         } catch {
@@ -193,6 +200,42 @@ private struct TransformersTokenizerBridge: MLXLMCommon.Tokenizer, Sendable {
             throw MalformedChatTemplate(
                 modelId: modelId, underlying: String(describing: error))
         }
+    }
+}
+
+/// Returns `nil` when the value must be dropped (JSON `null` / NSNull), otherwise a
+/// structure with every nested null removed. See `TransformersTokenizerBridge.applyChatTemplate`.
+func sanitizeForJinja(_ value: any Sendable) -> (any Sendable)? {
+    if value is NSNull { return nil }
+    let mirror = Mirror(reflecting: value)
+    if mirror.displayStyle == .optional {
+        guard let child = mirror.children.first else { return nil }
+        return sanitizeForJinja(child.value as any Sendable)
+    }
+    if let dict = value as? [String: Any] {
+        var out: [String: any Sendable] = [:]
+        for (key, val) in dict {
+            if let cleaned = sanitizeForJinja(val as any Sendable) {
+                out[key] = cleaned
+            }
+        }
+        return out
+    }
+    if let arr = value as? [Any] {
+        return arr.compactMap { sanitizeForJinja($0 as any Sendable) }
+    }
+    return value
+}
+
+extension Dictionary where Key == String, Value == any Sendable {
+    func mapValuesDeep(_ transform: (any Sendable) -> (any Sendable)?) -> [String: any Sendable] {
+        var out: [String: any Sendable] = [:]
+        for (key, val) in self {
+            if let cleaned = transform(val) {
+                out[key] = cleaned
+            }
+        }
+        return out
     }
 }
 
@@ -1115,6 +1158,37 @@ struct MLXServer: AsyncParsableCommand {
             // supply. Neither is a reason to refuse to start.
         }
 
+        // Issue #168: render once more with a minimal non-empty tools array. The probe
+        // above uses `tools: nil`, so a checkpoint whose template (or tool payload)
+        // breaks only under the tools branch loaded clean and then failed every real
+        // agentic request. Warn rather than abort: a tools-broken model still serves
+        // plain chat and /v1/completions.
+        do {
+            let probeTokenizer = await container.tokenizer
+            let probeTool: [String: any Sendable] = [
+                "type": "function",
+                "function": [
+                    "name": "probe",
+                    "description": "startup chat-template tools probe",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "query": ["type": "string", "default": NSNull() as any Sendable]
+                        ],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+            _ = try probeTokenizer.applyChatTemplate(
+                messages: [["role": "user", "content": "ping"]],
+                tools: [probeTool],
+                additionalContext: ["add_generation_prompt": true]
+            )
+        } catch let error as MalformedChatTemplate {
+            print("[SwiftLM] ⚠️  chat-template tools probe failed (plain chat may still work): \(error.description)")
+        } catch {
+            // Same lenient pass as above: no template, or context the probe lacks.
+        }
+
         print("[SwiftLM] Model loaded. Starting HTTP server on \(host):\(port)")
 
         // ── Capture CLI defaults into a shared config ──
@@ -1777,6 +1851,7 @@ func handleChatCompletion(
 
     // ── Acquire slot (concurrency limiter) ──
     await semaphore.wait()
+    let slot = GenerationSlot(semaphore: semaphore)
     await stats.requestStarted()
     let genStart = Date()
 
@@ -1849,6 +1924,15 @@ func handleChatCompletion(
     fflush(stdout)
     let prefillStart = Date()
 
+    let modelId = config.modelId
+
+    // ── Generation start (deferred for streaming) ──
+    // For streaming responses this closure runs inside the SSE consumer task
+    // AFTER the response headers are on the wire, so a long prefill cannot
+    // leave the client staring at a silent connection (client idle-timeout →
+    // ECONNRESET → retry with an ever-grown payload). Non-streaming awaits it
+    // inline, exactly as before. (Body indentation intentionally unchanged.)
+    let startGeneration: () async throws -> (AsyncStream<Generation>, (() async -> Void)?) = {
     // ── DFlash block-diffusion speculative decoding ──
     // When --dflash is enabled and both DFlash draft model and target model conform
     // to DFlashTargetModel, we use DFlashRuntime.generate instead of the standard path.
@@ -1892,24 +1976,7 @@ func handleChatCompletion(
             }
         }
 
-        let modelId = config.modelId
-        if isStream {
-            return handleChatStreaming(
-                stream: genStream, modelId: modelId, stopSequences: stopSequences,
-                includeUsage: includeUsage, promptTokenCount: promptTokenCount,
-                enableThinking: enableThinking, thinkingPreOpened: thinkingPreOpened,
-                jsonMode: jsonMode, semaphore: semaphore,
-                stats: stats, genStart: genStart, prefillStart: prefillStart,
-                emitPrefillProgress: false, onPrefillDone: nil
-            )
-        } else {
-            return try await handleChatNonStreaming(
-                stream: genStream, modelId: modelId, stopSequences: stopSequences,
-                promptTokenCount: promptTokenCount, enableThinking: enableThinking,
-                thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, semaphore: semaphore,
-                stats: stats, genStart: genStart, prefillStart: prefillStart, onPrefillDone: nil
-            )
-        }
+        return (genStream, nil)
     }
 
     // ── Cache-aware generation (standard path) ──
@@ -2017,23 +2084,24 @@ func handleChatCompletion(
         }
         return (stream, onPrefillDone)
     }
-
-    let modelId = config.modelId
+        return (stream, onPrefillDone)
+    }  // end startGeneration
 
     if isStream {
         return handleChatStreaming(
-            stream: stream, modelId: modelId, stopSequences: stopSequences,
+            startGeneration: startGeneration, modelId: modelId, stopSequences: stopSequences,
             includeUsage: includeUsage, promptTokenCount: promptTokenCount,
             enableThinking: enableThinking, thinkingPreOpened: thinkingPreOpened,
-            jsonMode: jsonMode, semaphore: semaphore,
+            jsonMode: jsonMode, slot: slot,
             stats: stats, genStart: genStart, prefillStart: prefillStart,
-            emitPrefillProgress: emitPrefillProgress, onPrefillDone: onPrefillDone
+            emitPrefillProgress: emitPrefillProgress
         )
     } else {
+        let (stream, onPrefillDone) = try await startGeneration()
         return try await handleChatNonStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
             promptTokenCount: promptTokenCount, enableThinking: enableThinking,
-            thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, semaphore: semaphore,
+            thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, slot: slot,
             stats: stats, genStart: genStart, prefillStart: prefillStart, onPrefillDone: onPrefillDone
         )
     }
@@ -2175,7 +2243,7 @@ actor PrefillState {
 }
 
 func handleChatStreaming(
-    stream: AsyncStream<Generation>,
+    startGeneration: @escaping () async throws -> (AsyncStream<Generation>, (() async -> Void)?),
     modelId: String,
     stopSequences: [String],
     includeUsage: Bool,
@@ -2183,12 +2251,11 @@ func handleChatStreaming(
     enableThinking: Bool = false,
     thinkingPreOpened: Bool = false,
     jsonMode: Bool = false,
-    semaphore: AsyncSemaphore,
+    slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date,
     prefillStart: Date,
-    emitPrefillProgress: Bool,
-    onPrefillDone: (() async -> Void)? = nil
+    emitPrefillProgress: Bool
 ) -> Response {
     let (sseStream, cont) = AsyncStream<String>.makeStream()
 
@@ -2197,7 +2264,9 @@ func handleChatStreaming(
     // We capture the hook in a local variable so that concurrent requests
     // cannot clobber each other's hook via the global. The global is still
     // written here because LLMModel.prepare() reads it, but the semaphore
-    // ensures only one generation runs at a time.
+    // ensures only one generation runs at a time. Installed BEFORE the
+    // response is returned: startGeneration (prefill) runs inside the
+    // consumer task below, so the hook is live for the whole prefill.
     var heartbeatTask: Task<Void, Never>? = nil
     activePrefillProgressHook = nil
     if emitPrefillProgress {
@@ -2224,7 +2293,12 @@ func handleChatStreaming(
         }
     }
 
-    Task {
+    // First byte on the wire before any model work: proves connection
+    // liveness so a long prefill cannot trip the client's idle timeout
+    // (e.g. Bun fetch's 10s) into an ECONNRESET-and-retry loop.
+    cont.yield(": connected\r\n\r\n")
+
+    let consumerTask: Task<Void, Never> = Task {
         var hasToolCalls = false
         var toolCallIndex = 0
         var completionTokenCount = 0
@@ -2241,14 +2315,31 @@ func handleChatStreaming(
         // arriving in a later chunk merges with the previous one.
         var emittedTextCount = 0
         var heldStopTail = ""
-        // Unconditional cleanup: guarantees heartbeat is cancelled on ALL exit paths
-        // (normal completion, client disconnect, or task cancellation during prefill).
+        // Unconditional cleanup: guarantees heartbeat is cancelled and the
+        // generation slot is returned on ALL exit paths (normal completion,
+        // startGeneration failure, client disconnect, or task cancellation).
         defer {
             heartbeatTask?.cancel()
             heartbeatTask = nil
             activePrefillProgressHook = nil
+            slot.release()
         }
-        
+
+        // Start generation only now — the response headers are already on the
+        // wire, so even a multi-second prefill leaves an idle-timeout-free
+        // connection (heartbeat chunks flow if the client opted in).
+        let generation: (stream: AsyncStream<Generation>, onPrefillDone: (() async -> Void)?)
+        do {
+            generation = try await startGeneration()
+        } catch {
+            _ = cont.yield(sseErrorChunk(error))
+            _ = cont.yield("data: [DONE]\r\n\r\n")
+            cont.finish()
+            return
+        }
+        let stream = generation.stream
+        let onPrefillDone = generation.onPrefillDone
+
         // ── JSON mode streaming: buffer early tokens to strip hallucinated prefixes ──
         var jsonBuffering = jsonMode
         var jsonBuffer = ""
@@ -2480,8 +2571,11 @@ func handleChatStreaming(
         cont.finish()
         let duration = Date().timeIntervalSince(genStart)
         await stats.requestFinished(tokens: completionTokenCount, duration: duration)
-        await semaphore.signal()
     }
+    // If the client disconnects, Hummingbird tears down the response body,
+    // terminating sseStream — cancel the consumer so the generation loop stops
+    // and the defer above returns the slot instead of finishing a dead download.
+    cont.onTermination = { _ in consumerTask.cancel() }
     return Response(
         status: .ok,
         headers: sseHeaders(),
@@ -2499,7 +2593,7 @@ func handleChatNonStreaming(
     enableThinking: Bool = false,
     thinkingPreOpened: Bool = false,
     jsonMode: Bool = false,
-    semaphore: AsyncSemaphore,
+    slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date,
     prefillStart: Date,
@@ -2549,7 +2643,7 @@ func handleChatNonStreaming(
     print("srv  slot done: id 0 | gen_tokens=\(completionTokenCount) | OS_RAM=\(String(format: "%.1f", postMemSnap.os))GB | MEM_DEMAND=\(String(format: "%.1f", postMemSnap.demand))GB | GPU_MEM=\(String(format: "%.1f", postMemSnap.gpu))GB")
     let duration = Date().timeIntervalSince(genStart)
     await stats.requestFinished(tokens: completionTokenCount, duration: duration)
-    await semaphore.signal()
+    slot.release()
 
     // ── Apply stop sequences to final text ──
     var finishReason: String
@@ -2702,6 +2796,7 @@ func handleTextCompletion(
     }
 
     await semaphore.wait()
+    let slot = GenerationSlot(semaphore: semaphore)
     await stats.requestStarted()
     let genStart = Date()
 
@@ -2711,19 +2806,23 @@ func handleTextCompletion(
     // ── Get actual prompt token count before generate() to avoid data race ──
     let promptTokenCount = lmInput.text.tokens.size
 
-    let stream = try await container.generate(input: lmInput, parameters: params)
     let modelId = config.modelId
 
     if isStream {
+        // Deferred: container.generate runs prefill; inside the consumer task it
+        // happens AFTER the response headers are on the wire (same rationale as
+        // the chat path — no silent-prefill idle timeout).
         return handleTextStreaming(
-            stream: stream, modelId: modelId, stopSequences: stopSequences,
-            promptTokenCount: promptTokenCount, semaphore: semaphore, stats: stats,
+            startGeneration: { try await container.generate(input: lmInput, parameters: params) },
+            modelId: modelId, stopSequences: stopSequences,
+            promptTokenCount: promptTokenCount, slot: slot, stats: stats,
             genStart: genStart, emitPrefillProgress: emitPrefillProgress
         )
     } else {
+        let stream = try await container.generate(input: lmInput, parameters: params)
         return try await handleTextNonStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
-            promptTokenCount: promptTokenCount, semaphore: semaphore, stats: stats, genStart: genStart
+            promptTokenCount: promptTokenCount, slot: slot, stats: stats, genStart: genStart
         )
     }
 }
@@ -2731,11 +2830,11 @@ func handleTextCompletion(
 // ── Text Streaming ───────────────────────────────────────────────────────────
 
 func handleTextStreaming(
-    stream: AsyncStream<Generation>,
+    startGeneration: @escaping () async throws -> AsyncStream<Generation>,
     modelId: String,
     stopSequences: [String],
     promptTokenCount: Int,
-    semaphore: AsyncSemaphore,
+    slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date,
     emitPrefillProgress: Bool
@@ -2764,7 +2863,9 @@ func handleTextStreaming(
             }
         }
     }
-    Task {
+    // First byte before any model work — same liveness guarantee as the chat path.
+    cont.yield(": connected\r\n\r\n")
+    let consumerTask: Task<Void, Never> = Task {
         var completionTokenCount = 0
         var fullText = ""
         var stopped = false
@@ -2773,12 +2874,22 @@ func handleTextStreaming(
         // a stop sequence (#133). Local to this loop; the chat path has its own pair.
         var emittedTextCount = 0
         var heldStopTail = ""
-        // Unconditional cleanup: guarantees heartbeat is cancelled on ALL exit paths
-        // (normal completion, client disconnect, or task cancellation during prefill).
+        // Unconditional cleanup: cancels the heartbeat and returns the generation
+        // slot on ALL exit paths (completion, startGeneration failure, disconnect).
         defer {
             heartbeatTask?.cancel()
             heartbeatTask = nil
             activePrefillProgressHook = nil
+            slot.release()
+        }
+        let stream: AsyncStream<Generation>
+        do {
+            stream = try await startGeneration()
+        } catch {
+            _ = cont.yield(sseErrorChunk(error))
+            _ = cont.yield("data: [DONE]\n\n")
+            cont.finish()
+            return
         }
         for await generation in stream {
             if stopped { break }
@@ -2857,8 +2968,8 @@ func handleTextStreaming(
         cont.finish()
         let duration = Date().timeIntervalSince(genStart)
         await stats.requestFinished(tokens: completionTokenCount, duration: duration)
-        await semaphore.signal()
     }
+    cont.onTermination = { _ in consumerTask.cancel() }
     return Response(
         status: .ok,
         headers: sseHeaders(),
@@ -2873,7 +2984,7 @@ func handleTextNonStreaming(
     modelId: String,
     stopSequences: [String],
     promptTokenCount: Int,
-    semaphore: AsyncSemaphore,
+    slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date
 ) async throws -> Response {
@@ -2894,7 +3005,7 @@ func handleTextNonStreaming(
     }
     let duration = Date().timeIntervalSince(genStart)
     await stats.requestFinished(tokens: completionTokenCount, duration: duration)
-    await semaphore.signal()
+    slot.release()
 
     var finishReason = "stop"
     if let (trimmedText, _) = checkStopSequences(fullText, stopSequences: stopSequences) {
@@ -2955,6 +3066,41 @@ actor AsyncSemaphore {
             let waiter = waiters.removeFirst()
             waiter.resume()
         }
+    }
+}
+
+/// Holds one slot acquired from ``AsyncSemaphore`` and guarantees it is
+/// released exactly once — whichever of an explicit `release()` or `deinit`
+/// fires first.
+///
+/// Without this, any `throw` after `semaphore.wait()` (e.g. `container.prepare`
+/// or `container.perform` failing) skipped every `signal()` call site and
+/// permanently leaked the slot; with the default `--parallel 1` a single failed
+/// request wedged the server for all subsequent generations until restart.
+final class GenerationSlot: @unchecked Sendable {
+    private let semaphore: AsyncSemaphore
+    private let lock = NSLock()
+    private var released = false
+
+    init(semaphore: AsyncSemaphore) {
+        self.semaphore = semaphore
+    }
+
+    func release() {
+        lock.lock()
+        let first = !released
+        released = true
+        lock.unlock()
+        guard first else { return }
+        // Bind locally: a closure that touches `self.semaphore` would capture
+        // `self`, which the runtime rejects (dangling ref) when this is called
+        // from `deinit`.
+        let sem = semaphore
+        Task { await sem.signal() }
+    }
+
+    deinit {
+        release()
     }
 }
 
@@ -3125,6 +3271,23 @@ func sseHeaders() -> HTTPFields {
     ])
 }
 
+/// Build an OpenAI-style SSE `error` event for a failure after the stream's
+/// headers are already sent (the client sees HTTP 200). The message is
+/// JSON-encoded, so quotes, backslashes and newlines in it stay valid JSON.
+func sseErrorChunk(_ error: Error) -> String {
+    let payload: [String: Any] = ["error": [
+        "message": String(describing: error),
+        "type": "server_error",
+        "code": "internal_error",
+    ]]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload),
+          let json = String(data: data, encoding: .utf8)
+    else {
+        return "data: {\"error\":{\"message\":\"internal error\",\"type\":\"server_error\",\"code\":\"internal_error\"}}\r\n\r\n"
+    }
+    return "data: \(json)\r\n\r\n"
+}
+
 /// Build a chat.completion.chunk SSE event.
 /// - reasoningContent: if non-nil, added to delta as "reasoning_content" (llama-server thinking style)
 /// - content: if non-nil, added to delta as "content" (standard response text)
@@ -3161,8 +3324,7 @@ func sseChunk(modelId: String, reasoningContent: String?, content: String?, fini
 
 /// Prefill-progress heartbeat chunk — emitted every 2s while the server is processing the prompt
 /// when explicitly enabled via `X-SwiftLM-Prefill-Progress: true`.
-/// It is sent as a named SSE event (`event: prefill_progress`) to avoid breaking strict
-/// OpenAI-compatible clients (e.g. OpenCode), which reject unknown `data:` objects.
+/// It is sent as a named SSE event (`event: prefill_progress`).
 /// Format mirrors llama-server's slot_update event:
 ///   n_past          : tokens evaluated so far (real value from chunked prefill, or 0 for single-chunk)
 ///   n_prompt_tokens : total prompt token count
@@ -3170,6 +3332,9 @@ func sseChunk(modelId: String, reasoningContent: String?, content: String?, fini
 ///   elapsed_seconds : wall-clock time since the request started
 /// Note: `model` is intentionally omitted — clients can correlate from preceding stream chunks.
 /// Note: `on` is accepted as a truthy header value for parity with common reverse proxy conventions.
+/// Issue #168: `choices: []` is present so strict OpenAI chunk validators (opencode's
+/// ChatCompletionChunk union) accept the payload even when they parse every `data:` line
+/// regardless of `event:`. The named event alone was not enough.
 func ssePrefillChunk(nPast: Int = 0, promptTokens: Int, elapsedSeconds: Int) -> String {
     let fraction = promptTokens > 0 ? Double(nPast) / Double(promptTokens) : 0.0
     let chunk: [String: Any] = [
@@ -3177,7 +3342,8 @@ func ssePrefillChunk(nPast: Int = 0, promptTokens: Int, elapsedSeconds: Int) -> 
         "n_past": nPast,
         "n_prompt_tokens": promptTokens,
         "fraction": fraction,
-        "elapsed_seconds": elapsedSeconds
+        "elapsed_seconds": elapsedSeconds,
+        "choices": [Any]()
     ]
     let data = try! JSONSerialization.data(withJSONObject: chunk)
     return "event: prefill_progress\r\ndata: \(String(data: data, encoding: .utf8)!)\r\n\r\n"

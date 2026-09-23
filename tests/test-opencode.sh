@@ -222,6 +222,81 @@ else
     fail "opencode-shaped request failed: $AGENT_OUT"
 fi
 
+# ── Test 3: tools + heartbeat combined (Issue #168) ────────────────
+# Test 1 covers heartbeat without tools; Test 2 covers tools without the heartbeat
+# header. Issue #168 reported both gaps at once: a tools-bearing request with
+# X-SwiftLM-Prefill-Progress enabled failed on the null-bearing tool schema (Jinja
+# NSNull conversion) *and* would have hit opencode's strict validation of the
+# prefill_progress payload. Exercise the intersection here.
+log "Test 3: tools + prefill-progress heartbeat (Issue #168)"
+
+cat << 'PYEOF' > /tmp/opencode_tools_heartbeat_test.py
+import json, os, sys
+import openai
+
+client = openai.OpenAI(base_url=os.environ["OPENAI_BASE_URL"], api_key="sk-test", max_retries=0)
+
+# A tool schema shaped like opencode's zod/effect output — includes JSON nulls
+# (`default: null`) that previously crashed swift-jinja Value.init(any:) with
+# "Cannot convert value of type Optional<Any> to Jinja Value" (#168).
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "bash",
+        "description": "Execute a shell command",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "command": {"type": "string"},
+                           "timeout": {"type": "integer", "default": None},
+                       },
+                       "required": ["command"]}}},
+]
+MESSAGES = [
+    {"role": "system", "content": "You are a coding agent."},
+    {"role": "user", "content": "Say hi."},
+]
+
+try:
+    stream = client.chat.completions.create(
+        model=os.environ["MODEL"], messages=MESSAGES, tools=TOOLS,
+        stream=True, max_tokens=64, temperature=0,
+        stream_options={"include_usage": True},
+        # Enables the named `event: prefill_progress` heartbeat payloads.
+        extra_headers={"X-SwiftLM-Prefill-Progress": "true"},
+    )
+except Exception as e:
+    print(f"Error: request rejected: {e}")
+    sys.exit(1)
+
+chunks = 0
+finish = None
+try:
+    for chunk in stream:
+        chunks += 1
+        for choice in chunk.choices:
+            if choice.finish_reason:
+                finish = choice.finish_reason
+except Exception as e:
+    print(f"Error: SSE stream failed to parse (heartbeat or tools payload rejected): {e}")
+    sys.exit(1)
+
+if chunks == 0:
+    print("Error: stream produced no chunks")
+    sys.exit(1)
+
+print(f"Success: {chunks} chunks, finish_reason={finish}")
+PYEOF
+
+set +e
+HB_OUT=$("$VENV_DIR/bin/python" /tmp/opencode_tools_heartbeat_test.py 2>&1)
+HB_EXIT=$?
+set -e
+
+if [ $HB_EXIT -eq 0 ]; then
+    pass "tools + heartbeat stream accepted — $HB_OUT"
+else
+    fail "tools + heartbeat stream rejected: $HB_OUT"
+fi
+
 # ── Results ──────────────────────────────────────────────────────────
 echo ""
 log "═══════════════════════════════════════"
