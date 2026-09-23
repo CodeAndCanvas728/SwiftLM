@@ -1321,14 +1321,10 @@ struct MLXServer: AsyncParsableCommand {
                     mtpAssistant: mtpAssistantModelRef
                 )
             } catch {
-                let errMsg = String(describing: error).replacingOccurrences(of: "\"", with: "'")
-                let payload = """
-                {"error":{"message":"\(errMsg)","type":"server_error","code":"internal_error"}}
-                """
                 return Response(
                     status: .internalServerError,
                     headers: jsonHeaders(),
-                    body: .init(byteBuffer: ByteBuffer(string: payload))
+                    body: .init(byteBuffer: ByteBuffer(string: errorJSON(error)))
                 )
             }
         }
@@ -1341,14 +1337,10 @@ struct MLXServer: AsyncParsableCommand {
                     request: request, bodyData: bodyData, config: config, container: container, semaphore: semaphore, stats: stats
                 )
             } catch {
-                let errMsg = String(describing: error).replacingOccurrences(of: "\"", with: "'")
-                let payload = """
-                {"error":{"message":"\(errMsg)","type":"server_error","code":"internal_error"}}
-                """
                 return Response(
                     status: .internalServerError,
                     headers: jsonHeaders(),
-                    body: .init(byteBuffer: ByteBuffer(string: payload))
+                    body: .init(byteBuffer: ByteBuffer(string: errorJSON(error)))
                 )
             }
         }
@@ -3271,10 +3263,9 @@ func sseHeaders() -> HTTPFields {
     ])
 }
 
-/// Build an OpenAI-style SSE `error` event for a failure after the stream's
-/// headers are already sent (the client sees HTTP 200). The message is
-/// JSON-encoded, so quotes, backslashes and newlines in it stay valid JSON.
-func sseErrorChunk(_ error: Error) -> String {
+/// Build an OpenAI-style `{"error":{...}}` body for a server error. The message
+/// is JSON-encoded, so quotes, backslashes and newlines in it stay valid JSON.
+func errorJSON(_ error: Error) -> String {
     let payload: [String: Any] = ["error": [
         "message": String(describing: error),
         "type": "server_error",
@@ -3283,9 +3274,15 @@ func sseErrorChunk(_ error: Error) -> String {
     guard let data = try? JSONSerialization.data(withJSONObject: payload),
           let json = String(data: data, encoding: .utf8)
     else {
-        return "data: {\"error\":{\"message\":\"internal error\",\"type\":\"server_error\",\"code\":\"internal_error\"}}\r\n\r\n"
+        return "{\"error\":{\"message\":\"internal error\",\"type\":\"server_error\",\"code\":\"internal_error\"}}"
     }
-    return "data: \(json)\r\n\r\n"
+    return json
+}
+
+/// Build an OpenAI-style SSE `error` event for a failure after the stream's
+/// headers are already sent (the client sees HTTP 200).
+func sseErrorChunk(_ error: Error) -> String {
+    "data: \(errorJSON(error))\r\n\r\n"
 }
 
 /// Build a chat.completion.chunk SSE event.
