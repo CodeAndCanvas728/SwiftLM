@@ -86,7 +86,7 @@ print_server_log() {
     fi
 }
 
-export METAL_LIBRARY_PATH="$(pwd)/.build/arm64-apple-macosx/release"
+export METAL_LIBRARY_PATH="$(cd .build/release 2>/dev/null && pwd -P)"
 
 if [ -n "${SUITE_OPT:-}" ]; then
     # Sub-process invocation from automated matrix — skip interactive menu
@@ -302,9 +302,8 @@ if { [ "$suite_opt" == "5" ] || [ "$suite_opt" == "6" ]; } && [[ "$FULL_MODEL" =
 fi
 
 # Quick sanity check
-if [ -f ".build/arm64-apple-macosx/release/SwiftLM" ]; then
-    BIN=".build/arm64-apple-macosx/release/SwiftLM"
-elif [ -f ".build/release/SwiftLM" ]; then
+# .build/release is a symlink to the real bin dir on every SwiftPM layout
+if [ -f ".build/release/SwiftLM" ]; then
     BIN=".build/release/SwiftLM"
 else
     echo "⚠️  SwiftLM release binary not found! Please compile the project by running ./build.sh first."
