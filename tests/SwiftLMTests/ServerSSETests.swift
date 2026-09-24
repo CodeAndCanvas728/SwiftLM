@@ -162,4 +162,15 @@ final class ServerSSETests: XCTestCase {
         XCTAssertEqual(err["type"] as? String, "server_error")
         XCTAssertEqual(err["code"] as? String, "internal_error")
     }
+
+    func testErrorJSONEncodesMessageAsValidJSON() throws {
+        let body = errorJSON(MessyError())
+
+        let obj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any])
+        let err = try XCTUnwrap(obj["error"] as? [String: Any])
+        XCTAssertEqual(err["message"] as? String, MessyError().description)
+        XCTAssertEqual(err["type"] as? String, "server_error")
+        XCTAssertEqual(err["code"] as? String, "internal_error")
+    }
 }
