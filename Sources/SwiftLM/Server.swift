@@ -1189,6 +1189,13 @@ struct MLXServer: AsyncParsableCommand {
             // Same lenient pass as above: no template, or context the probe lacks.
         }
 
+        // mlx-swift-lm's concurrent loader materializes every tensor in the
+        // checkpoint before `sanitize` runs, so tensors the model drops (e.g. a
+        // vision tower when loading text-only) are freed into MLX's buffer cache.
+        // With --stream-experts the cache limit is the SSD budget, so those
+        // buffers would otherwise stay resident for the life of the server.
+        Memory.clearCache()
+
         print("[SwiftLM] Model loaded. Starting HTTP server on \(host):\(port)")
 
         // ── Capture CLI defaults into a shared config ──
@@ -1888,7 +1895,7 @@ func handleChatCompletion(
     // true, it evaluates to false and still breaks. We MUST explicitly pass the boolean.
     let templateContext: [String: any Sendable] = ["enable_thinking": enableThinking]
     let userInput = UserInput(chat: chatMessages, tools: toolSpecs, additionalContext: templateContext)
-    print("[Server Debug] Created UserInput with \(userInput.images.count) images and \(userInput.audio.count) audio inputs.")
+    print("[Server Debug] Created UserInput with \(userInput.images.count) images and \(userInput.audios.count) audio inputs.")
     let lmInput = try await container.prepare(input: userInput)
 
     // ── Prompt caching: full token sequence for prefix matching ──
@@ -1962,6 +1969,18 @@ func handleChatCompletion(
                         break
                     case .summary(let summary):
                         print("[SwiftLM] DFlash summary: \(summary.generationTokens) tokens, \(String(format: "%.1f", summary.tokensPerSecond)) tok/s, acceptance=\(String(format: "%.1f%%", summary.acceptanceRatio * 100)), \(summary.cyclesCompleted) cycles")
+                        // The SSE/non-streaming handlers emit finish_reason, usage and
+                        // `[DONE]` from `.info`. Without it, a DFlash run that ends on EOS
+                        // or max_tokens (rather than a textual stop sequence) closes the
+                        // stream with no `[DONE]` sentinel.
+                        let prefillSec = summary.phaseTimingsUs.prefill / 1_000_000.0
+                        continuation.yield(.info(GenerateCompletionInfo(
+                            promptTokenCount: summary.promptTokenCount,
+                            generationTokenCount: summary.generationTokens,
+                            promptTime: prefillSec,
+                            generationTime: summary.elapsedUs / 1_000_000.0 - prefillSec,
+                            stopReason: summary.generationTokens >= tokenLimit ? .length : .stop
+                        )))
                     }
                 }
                 continuation.finish()
@@ -1973,7 +1992,7 @@ func handleChatCompletion(
 
     // ── Cache-aware generation (standard path) ──
     let (stream, onPrefillDone) = try await container.perform { context -> (AsyncStream<Generation>, (() async -> Void)?) in
-        let cache = context.model.newCache(parameters: params)
+        let cache = try context.model.newCache(parameters: params)
 
         // ── TurboQuant: enable 3-bit KV compression on every KVCacheSimple layer ──
         // This compresses cache history older than 8192 tokens into 3.5-bit Polar+QJL
@@ -2478,6 +2497,14 @@ func handleChatStreaming(
                 cont.yield(sseToolCallChunk(modelId: modelId, index: toolCallIndex, name: tc.function.name, arguments: argsJson))
                 toolCallIndex += 1
 
+            case .rejectedToolCall(let rejection):
+                // `.rejectedToolCall` is new as of mlx-swift-lm 348ff97: a tool-call-shaped
+                // model output that failed parsing/authorization. There's no OpenAI wire
+                // shape for it, so it isn't forwarded to the client — just logged. Per
+                // `RejectedToolCall`'s doc comment, never log `rawTextPreview`; it may
+                // contain sensitive argument text.
+                print("[SwiftLM] Rejected tool call: reason=\(rejection.reason) tool=\(rejection.toolName ?? "?") detail=\(rejection.detail ?? "n/a")")
+
             case .info(let info):
                 heartbeatTask?.cancel()
                 heartbeatTask = nil
@@ -2626,6 +2653,9 @@ func handleChatNonStreaming(
                 function: ToolCallFunction(name: tc.function.name, arguments: argsJson)
             ))
             tcIndex += 1
+        case .rejectedToolCall(let rejection):
+            // See the matching comment in `handleChatStreaming`: log only, no wire shape.
+            print("[SwiftLM] Rejected tool call: reason=\(rejection.reason) tool=\(rejection.toolName ?? "?") detail=\(rejection.detail ?? "n/a")")
         case .info(let info):
             generationStopReason = info.stopReason
         }
@@ -2926,7 +2956,8 @@ func handleTextStreaming(
                         cont.yield(sseTextChunk(modelId: modelId, text: releasable, finishReason: nil))
                     }
                 }
-            case .toolCall:
+            case .toolCall, .rejectedToolCall:
+                // Text-completion endpoint: tool calling has no wire representation here.
                 break
             case .info(let info):
                 heartbeatTask?.cancel()
@@ -2991,7 +3022,7 @@ func handleTextNonStreaming(
             if completionTokenCount % 8 == 0 {
                 try? await Task.sleep(for: .microseconds(50))
             }
-        case .toolCall, .info:
+        case .toolCall, .rejectedToolCall, .info:
             break
         }
     }
@@ -3516,27 +3547,37 @@ struct ChatCompletionRequest: Decodable {
             
             switch role {
             case "system", "developer":
-                return .system(text, images: imgs, audio: aud)
+                return .system(text, images: imgs, audios: aud)
             case "assistant":
-                var formattedToolCalls: [[String: any Sendable]]? = nil
+                // `Chat.Message.assistant(...)` takes `[ToolCall]?` as of
+                // mlx-swift-lm 348ff97 (previously a raw `[[String: any Sendable]]?`
+                // dictionary array), and no longer accepts `audios:` — assistant
+                // messages don't carry input audio.
+                var formattedToolCalls: [ToolCall]? = nil
                 if let tc = tool_calls, !tc.isEmpty {
-                    formattedToolCalls = tc.enumerated().map { (index, call) in
-                        [
-                            "index": index,
-                            "id": call.id,
-                            "type": call.type,
-                            "function": [
-                                "name": call.function.name,
-                                "arguments": call.function.arguments
-                            ] as [String: any Sendable]
-                        ] as [String: any Sendable]
+                    formattedToolCalls = tc.map { call in
+                        // `call.function.arguments` is the raw JSON-string form (as sent
+                        // by an OpenAI-style client); `ToolCall.Function` wants it decoded
+                        // into `[String: JSONValue]`. Fall back to an empty dict if it
+                        // isn't valid JSON rather than dropping the whole tool call.
+                        let argsDict: [String: JSONValue]
+                        if let data = call.function.arguments.data(using: .utf8),
+                            let decoded = try? JSONDecoder().decode([String: JSONValue].self, from: data)
+                        {
+                            argsDict = decoded
+                        } else {
+                            argsDict = [:]
+                        }
+                        return ToolCall(
+                            function: .init(name: call.function.name, arguments: argsDict),
+                            id: call.id)
                     }
                 }
-                return .assistant(text, images: imgs, audio: aud, toolCalls: formattedToolCalls)
+                return .assistant(text, images: imgs, toolCalls: formattedToolCalls)
             case "tool":
-                return .tool(text, toolCallId: tool_call_id)
+                return .tool(text, id: tool_call_id)
             default:
-                return .user(text, images: imgs, audio: aud)
+                return .user(text, images: imgs, audios: aud)
             }
         }
     }
@@ -3814,7 +3855,7 @@ public struct ALMUserInputProcessor: UserInputProcessor, @unchecked Sendable {
                 messages: messages, tools: input.tools, additionalContext: input.additionalContext)
             
             // Check if there is audio to interleave
-            if !input.audio.isEmpty {
+            if !input.audios.isEmpty {
                 print("[ALM] Interleaving Audio Tokens into prompt.")
                 // Mock num audio embeddings for now - typically derived from the model or audio lengths
                 let rawSequence = fusionProcessor.interleave(
@@ -3834,7 +3875,15 @@ public struct ALMUserInputProcessor: UserInputProcessor, @unchecked Sendable {
     }
 }
 
-public final class ALMModelFactory: ModelFactory, @unchecked Sendable {
+// `class X: ModelFactory` (the constrained `GenericModelFactory<ModelContext,
+// ModelContainer>` typealias) is no longer a legal inheritance clause as of
+// mlx-swift-lm 348ff97 — a class can't inherit from a protocol type that
+// supplies primary associated-type arguments. Upstream's own factories
+// (`LLMModelFactory`, `VLMModelFactory`) switched to conforming to the
+// unconstrained `GenericModelFactory` protocol directly, letting `ContextType`/
+// `ContainerType` be inferred as `ModelContext`/`ModelContainer` from the
+// `_load`/`_wrap` implementations below; do the same here.
+public final class ALMModelFactory: GenericModelFactory, @unchecked Sendable {
     public static let shared = ALMModelFactory()
     public let typeRegistry: ModelTypeRegistry = LLMTypeRegistry.shared
     public let modelRegistry: AbstractModelRegistry = LLMRegistry.shared
@@ -3889,7 +3938,7 @@ public struct OmniUserInputProcessor: UserInputProcessor, @unchecked Sendable {
             return vlmInput
         }
         
-        if !input.audio.isEmpty && !tokens.isEmpty {
+        if !input.audios.isEmpty && !tokens.isEmpty {
             print("[Omni] Interleaving Audio Tokens into VLM prompt structure.")
             let rawSequence = fusionProcessor.interleave(
                 textTokens: tokens,
@@ -3903,7 +3952,9 @@ public struct OmniUserInputProcessor: UserInputProcessor, @unchecked Sendable {
     }
 }
 
-public final class OmniModelFactory: ModelFactory, @unchecked Sendable {
+// See the comment on `ALMModelFactory` above: conform to the unconstrained
+// `GenericModelFactory` protocol, not the constrained `ModelFactory` typealias.
+public final class OmniModelFactory: GenericModelFactory, @unchecked Sendable {
     public static let shared = OmniModelFactory()
     public let typeRegistry: ModelTypeRegistry = VLMTypeRegistry.shared
     public let modelRegistry: AbstractModelRegistry = VLMRegistry.shared

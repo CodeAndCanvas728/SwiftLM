@@ -19,6 +19,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Select Xcode 26 (Swift 6.2)
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+
       - name: Install Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain || true
 
@@ -200,6 +203,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Select Xcode 26 (Swift 6.2)
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+
       - name: Install Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain || true
 
@@ -300,6 +306,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Select Xcode 26 (Swift 6.2)
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+
       - name: Install Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain || true
 
@@ -398,7 +407,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      
+
+      - name: Select Xcode 26 (Swift 6.2)
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+
       - name: Install Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain || true
 
@@ -556,6 +568,10 @@ jobs:
         with:
           name: swiftlm-architecture
           path: .build/release/
+
+      - name: Select Xcode 26 (Swift 6.2)
+        if: hashFiles('.build/release/SwiftLM') == ''
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
 
       - name: Build (Release) if artifact missing
         run: |

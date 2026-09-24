@@ -749,7 +749,7 @@ extension InferenceEngine {
                     // TurboKV: enable 3-bit PolarQuant+QJL on every KVCacheSimple cache layer.
                     // KVCacheSimple is a cache object (not a neural-network Module), so we
                     // iterate the cache array — mirroring the pattern in Server.swift.
-                    let cache = await container.perform { ctx in ctx.model.newCache(parameters: params) }
+                    let cache = try await container.perform { ctx in try ctx.model.newCache(parameters: params) }
                     if config.turboKV {
                         for layer in cache {
                             if let simple = layer as? KVCacheSimple {
@@ -821,8 +821,13 @@ extension InferenceEngine {
 
                             continuation.yield(GenerationToken(text: text, isThinking: thinkingActive))
                         } else if case .info(let info) = generation {
-                            if info.totalDraftTokens > 0 {
-                                mtpAcceptanceRate = Double(info.acceptedDraftTokens) / Double(info.totalDraftTokens)
+                            // `proposedDraftTokens`/`acceptedDraftTokens` are `Int?` as of
+                            // mlx-swift-lm 348ff97 (nil for non-MTP iterators, renamed from
+                            // the previously non-optional `totalDraftTokens`/`acceptedDraftTokens`).
+                            if let proposed = info.proposedDraftTokens, proposed > 0,
+                                let accepted = info.acceptedDraftTokens
+                            {
+                                mtpAcceptanceRate = Double(accepted) / Double(proposed)
                             }
                         }
                     }
