@@ -30,7 +30,7 @@ import time
 import urllib.request
 import urllib.error
 
-SWIFTLM_PATH = ".build/arm64-apple-macosx/release/SwiftLM"
+SWIFTLM_PATH = ".build/release/SwiftLM"
 PORT = 5430
 
 CONFIGS = [
