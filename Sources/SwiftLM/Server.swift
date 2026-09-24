@@ -1696,8 +1696,13 @@ actor PromptCache {
     /// produce lazy computation graphs (e.g. TurboKV decode → reshape → concatenate).
     /// If not materialized now, those lazy references point to the live cache tensors
     /// which get overwritten by subsequent requests, causing stale data / SIGTRAP on restore.
-    func save(tokens: [Int], cache: [KVCache]) {
-        if cache.contains(where: { $0 is MambaCache }) {
+    ///
+    /// Recurrent (MambaCache) layers are refused unless `allowRecurrent` is set: their
+    /// state is only valid if captured at exactly `tokens.count`, which the generic
+    /// post-first-token save cannot guarantee. Only the hybrid path (which snapshots at
+    /// a known boundary) passes true.
+    func save(tokens: [Int], cache: [KVCache], allowRecurrent: Bool = false) {
+        if !allowRecurrent, cache.contains(where: { $0 is MambaCache }) {
             return
         }
         let P = tokens.count
@@ -1800,7 +1805,44 @@ actor PromptCache {
         return matchLen
     }
 
+    /// Hybrid-model restore. Recurrent state cannot be trimmed, only resumed, so the
+    /// cached sequence is reusable only if it is an exact prefix of `newTokens` no longer
+    /// than `limit`. Returns the cached length (tokens now in `cache`), or nil on a miss.
+    func restoreExactPrefix(newTokens: [Int], limit: Int, into cache: [KVCache]) -> Int? {
+        guard let cached, !cached.tokens.isEmpty, cached.tokens.count <= limit,
+              cached.states.count == cache.count, newTokens.starts(with: cached.tokens)
+        else {
+            misses += 1
+            return nil
+        }
+        for (i, layer) in cache.enumerated() {
+            var layer = layer
+            layer.state = cached.states[i]
+            // ArraysCache's metaState setter traps; it carries no metadata to restore.
+            if !(layer is MambaCache) { layer.metaState = cached.metaStates[i] }
+        }
+        hits += 1
+        print("[SwiftLM] \u{1F5C2} Prompt cache HIT (hybrid): \(cached.tokens.count)/\(newTokens.count) tokens reused")
+        return cached.tokens.count
+    }
+
     func stats() -> (hits: Int, misses: Int) { (hits, misses) }
+}
+
+/// Where a hybrid (recurrent + attention) model's prompt cache may snapshot: the index
+/// of the last `<|im_start|>`, i.e. the start of the turn being generated.
+///
+/// Everything before it is history that the next agent request re-renders identically.
+/// The generation prompt after it (`assistant\n<think>…`) is not always a prefix of
+/// its own re-rendered form. Returns nil when the model is not hybrid, the template is
+/// not ChatML, or there is no history to cache.
+func hybridCacheBoundary(promptTokens: [Int], imStartId: Int?, cache: [KVCache]) -> Int? {
+    guard let imStartId,
+          cache.contains(where: { $0 is MambaCache }),
+          cache.allSatisfy({ $0 is MambaCache || type(of: $0) == KVCacheSimple.self }),
+          let boundary = promptTokens.lastIndex(of: imStartId), boundary > 0
+    else { return nil }
+    return boundary
 }
 
 // ── Request Body Extraction ──────────────────────────────────────────────────
@@ -2091,8 +2133,37 @@ func handleChatCompletion(
         // produced with KVCacheSimple; restoring it into a QuantizedKVCache (or vice-versa)
         // is unsafe and produces incorrect results or runtime failures.
         let skipPromptCache = isMultimodalRequest || params.kvBits != nil
+
+        // ── Hybrid (recurrent + attention) prompt cache ──
+        // Qwen3.5/3.6-style models pair MambaCache (linear attention) with KVCacheSimple
+        // layers, and the generic path below refuses them: recurrent state cannot be
+        // trimmed, and the onPrefillDone save runs after the first decode token has been
+        // fed. Without this, every agent turn re-prefills the whole conversation. Instead:
+        // resume from an exact cached prefix, prefill to the turn boundary, snapshot there
+        // synchronously, then generate the few tokens after it.
+        let hybridBoundary = (skipPromptCache || draftModelRef != nil || config.mtp || config.turboKV)
+            ? nil
+            : hybridCacheBoundary(
+                promptTokens: promptTokens,
+                imStartId: context.tokenizer.convertTokenToId("<|im_start|>"), cache: cache)
         var stream: AsyncStream<Generation>
-        if let draftRef = draftModelRef {
+        if let boundary = hybridBoundary {
+            let start = await promptCache.restoreExactPrefix(
+                newTokens: promptTokens, limit: boundary, into: cache) ?? 0
+            if start < boundary {
+                // TokenIterator.init prefills its input into `cache` (same chunking and
+                // SSD-streaming error handling as a cold prefill), then samples one token
+                // without feeding it back, so the cache ends at exactly `boundary`.
+                _ = try TokenIterator(
+                    input: LMInput(tokens: lmInput.text.tokens[start..<boundary]),
+                    model: context.model, cache: cache, parameters: params)
+                await promptCache.save(
+                    tokens: Array(promptTokens[..<boundary]), cache: cache, allowRecurrent: true)
+            }
+            stream = try MLXLMCommon.generate(
+                input: LMInput(tokens: lmInput.text.tokens[boundary...]),
+                cache: cache, parameters: params, context: context)
+        } else if let draftRef = draftModelRef {
             // Speculative decoding path: draft model generates candidates, main model verifies.
             // Bypass prompt cache to avoid draft/main KV drift on partial-match restores.
             print("[SwiftLM] Using speculative decoding (\(numDraftTokens) draft tokens/round)")
@@ -2153,6 +2224,9 @@ func handleChatCompletion(
             return false
         }
         let onPrefillDone: (() async -> Void)? = {
+            // The hybrid path already saved at its boundary; a save here would capture
+            // recurrent state one decode token too late.
+            guard hybridBoundary == nil else { return }
             if turboHasCompressed {
                 print("[SwiftLM] 🧠 Skipping prompt cache save — TurboQuant has compressed \(cache.compactMap { ($0 as? KVCacheSimple)?.compressedOffset }.max() ?? 0) tokens. Saving would decode ~37 GB back to fp16.")
             } else if params.kvBits != nil {
