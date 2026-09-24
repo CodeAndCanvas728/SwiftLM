@@ -64,27 +64,29 @@ The first SwiftLM numbers from a **32 GB** Mac. Every other table in this README
 
 | Model (4-bit unless noted) | Weights | Mode | Decode, short prompt | Longest prompt that passed | Peak GPU |
 |---|---|---|---|---|---|
-| **`gemma-4-26b-a4b-it-4bit`** (MoE, ~4B active) | 15.3 GB | GPU | **53.3 tok/s** | 80.7K tokens | 20.2 GB |
+| **`gemma-4-26b-a4b-it-4bit`** (MoE, ~4B active) | 15.3 GB | GPU | **52.2 tok/s** | 80.7K tokens | 19.5 GB |
 | **`Qwen3.6-35B-A3B-UD-MLX-4bit`** (MoE, ~3B active) | 21.6 GB | GPU | **46.7 tok/s** | 40.8K tokens | 22.4 GB |
 | `Qwen3.6-35B-A3B-UD-MLX-4bit` | 21.6 GB | `--stream-experts` | 13.2 tok/s | 40.8K tokens | 7.7 GB |
-| `Qwen3.8-27B-4bit` (dense) | 11.3 GB | GPU | 9.1 tok/s | 40.8K tokens | 19.6 GB |
+| `Qwen3.8-27B-4bit` (dense) | 11.3 GB | GPU | 9.3 tok/s | 40.8K tokens | 18.4 GB |
 | `gemma-4-26b-a4b-it-8bit` | ~26 GB | GPU | swaps (+3.1 GB on the first prompt) | — | — |
 | `gemma-4-26b-a4b-it-8bit` | ~26 GB | `--stream-experts` | 8.8 tok/s | 9.5K tokens (32K swapped) | 7.6 GB |
 
 - **MoE models are the sweet spot at 32 GB.** Only the active experts are read for each token, so they decode 5–6× faster than a dense 27B. A 4-bit MoE with up to about 22 GB of weights runs entirely on the GPU.
 - **Qwen3.6-35B-A3B on a base M6 reaches 76%** of the M1 Ultra 64 GB decode speed below (46.7 vs 61.7 tok/s).
-- **Dense 27B decode is bandwidth-bound.** 9.1 tok/s × 11.3 GB is about 100 GB/s, roughly 60% of the M6's rated 170 GB/s.
+- **Dense 27B decode is bandwidth-bound.** 9.3 tok/s × 11.3 GB is about 105 GB/s, roughly 60% of the M6's rated 170 GB/s.
 - **An 8-bit 26 GB model needs SSD streaming** and tops out at about 10K tokens of context.
 
 ### Gemma-4-26B-A4B 4-bit — by prompt length
 
-| Prompt tokens | Prefill | TTFT | Decode | Peak GPU · swap growth |
+| Prompt tokens | Vanilla prefill / decode (tok/s) | TTFT | `--turbo-kv` prefill / decode (tok/s) | Peak GPU · swap growth |
 |---|---|---|---|---|
-| 534 | 859 tok/s | 0.7 s | **53.3 tok/s** | 15.2 GB · 0 |
-| 2,285 | **998 tok/s** | 2.4 s | 50.1 tok/s | 15.8 GB · 0 |
-| 9,544 | 914 tok/s | 10.7 s | 44.9 tok/s | 16.5 GB · 0 |
-| 39,773 | 750 tok/s | 53.9 s | 31.4 tok/s | 19.1 GB · 0 |
-| 80,711 | 625 tok/s | 130.6 s | 21.8 tok/s | 20.2 GB · 0 |
+| ~530 | 733 / **52.2** | 0.8 s | 785 / 53.2 | 14.5 GB · 0 |
+| ~2.3K | **963** / 50.2 | 2.5 s | 969 / 50.5 | 15.0 GB · 0 |
+| ~9.5K | 959 / 45.1 | 10.1 s | 971 / 45.5 | 15.8 GB · 0 |
+| ~39.7K | 757 / 31.0 | 53.3 s | 787 / 31.5 | 17.9 GB · 0 |
+| ~80.7K | 622 / 24.3 | 131.3 s | 630 / 24.5 | 19.5 GB · 0 |
+
+Every needle check passed in both modes. `--mtp` with the bf16 assistant (`gemma-4-26B-A4B-it-assistant-bf16`) works but is slower on the M6: 45.2 / 35.6 / 30.4 tok/s decode at ~530 / 2.3K / 9.5K tokens, against 53.0 / 50.8 / 46.0 without it. A 4-bit MoE is compute-bound, so verifying the drafted tokens costs more than it saves (the same finding as the M5 Pro tables below).
 
 ### Qwen3.6-35B-A3B 4-bit — GPU vs SSD streaming
 
@@ -99,33 +101,33 @@ The first SwiftLM numbers from a **32 GB** Mac. Every other table in this README
 
 | Prompt tokens | Vanilla prefill / decode (tok/s) | TurboKV prefill / decode (tok/s) | Peak GPU · swap growth |
 |---|---|---|---|
-| ~550 | 105 / 9.1 | 102 / 9.3 | 16.5 GB · 0 |
-| ~2.3K | 108 / 8.8 | 108 / 9.2 | 16.2 GB · 0 |
-| ~9.8K | 96 / 8.6 | 98 / 8.3 | 16.7 GB · 0 |
-| ~40.8K | 88 / 7.9 | 85 / 7.3 | 19.6 GB · +0.7 GB (TurboKV +1.5 GB) |
+| ~550 | 233 / 9.3 | 231 / 9.3 | 15.2 GB · 0 |
+| ~2.3K | 242 / 9.1 | 261 / 9.2 | 16.1 GB · 0 |
+| ~9.8K | 238 / 8.9 | 250 / 8.9 | 16.9 GB · 0 |
+| ~40.8K | 200 / 7.9 | 202 / 7.9 | 18.4 GB · 0 (TurboKV 16.9 GB) |
 
-TurboKV doesn't help this model. Only 16 of its 64 layers use full attention (the other 48 are GatedDeltaNet), so the KV cache is already small.
+TurboKV barely changes speed on this model. Only 16 of its 64 layers use full attention (the other 48 are GatedDeltaNet), so the KV cache is already small. It saves about 1.5 GB at 40K tokens.
 
 ### What 32 GB exposed
 
-| 8.5K-token prompt, Qwen3.8-27B-4bit | Before | After |
+| 8.5K-token prompt, Qwen3.8-27B-4bit | Before (old pin) | After (this release) |
 |---|---|---|
-| Prefill | 33.4 tok/s | **106.7 tok/s** (3.2×) |
-| Peak process memory | 38 GB | **19 GB** |
+| Prefill | 33.4 tok/s | **~240 tok/s** (≈7×; 238 tok/s measured at 9.8K) |
+| Peak memory | 38 GB process footprint | **≤19 GB** process (16.9 GB GPU peak at 9.8K) |
 | Swap growth | +15 GB | **0** |
 
 1. **The MLX buffer cache was unbounded on full-GPU loads.** It could grow to the whole 26.8 GB working set. It is now sized from the RAM left after weights and KV.
 2. **The KV-cache estimate counted every layer as full attention.** Gemma 4 (25 of 30 layers use a 1,024-token sliding window) was overestimated 10×, and Qwen3.5/3.8 (48 of 64 layers are linear attention) 4×. On 32 GB that pushed Gemma into CPU/GPU layer partitioning, which crashed with a Metal GPU timeout.
 3. **An auto-detected VLM that failed to load exited the server.** `Qwen3.6-35B-A3B-UD-MLX-4bit` ships a `preprocessor_config.json` without `image_mean`. SwiftLM now falls back to text-only unless you pass `--vision`.
-4. **Vision-capable models skipped chunked prefill.** On the VLM path, a text-only prompt ran through the model in a single pass. This one is fixed on mlx-swift-lm `main` and lands here with the next mlx-swift-lm bump. Until then, long prompts on Qwen3.5/3.8 and Gemma 4 use far more memory than the tables above.
+4. **Vision-capable models skipped chunked prefill.** On the older mlx-swift-lm pin, a text-only prompt on the VLM path ran through the model in a single pass. It's fixed by the mlx-swift-lm bump in #167. Every number in this section was measured on `main` with that bump.
 
-> ⚠️ **Known issues on 32 GB:** `--turbo-kv` with Gemma 4 crashes in Metal when a prompt-cache save runs during generation, and dropped the digits of the code word in 2 of 3 runs at 2K. The Gemma 4 MTP assistant (`gemma-4-26B-A4B-it-qat-assistant-4bit`) doesn't load on the current mlx-swift-lm pin. Both are expected to clear with the mlx-swift-lm bump.
+> ⚠️ **Known issues:** `--gpu-layers N` (CPU/GPU layer partitioning) hits a Metal GPU timeout on the first request (repro: `--model mlx-community/gemma-4-26b-a4b-it-4bit --gpu-layers 23`). QAT-quantized Gemma 4 MTP assistants (`…-qat-assistant-4bit`) fail with `unhandledKeys pre_projection/post_projection`; use `gemma-4-26B-A4B-it-assistant-bf16`.
 
 Reproduce:
 
 ```bash
 ./build.sh
-.build/release/SwiftLM --model mlx-community/gemma-4-26b-a4b-it-4bit --port 5431 &
+.build/release/SwiftLM --model mlx-community/gemma-4-26b-a4b-it-4bit --port 5431 --ctx-size 48000 &
 python3 scripts/demo/stream_client.py short
 python3 scripts/profiling/m6_bench.py --model mlx-community/gemma-4-26b-a4b-it-4bit \
   --config "Vanilla=" --contexts 512,2048,8192,32768,65536 --out docs/profiling/m6/gemma4_26b_a4b_4bit

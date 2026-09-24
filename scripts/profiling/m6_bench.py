@@ -272,6 +272,8 @@ def main():
                     gen_tokens=gen_tokens,
                     needle_ok=code in text,
                     degenerate=is_degenerate(text),
+                    code=code,
+                    answer_head=text[:240],  # enough to see what a needle miss actually said
                 )
                 rows.append(row)
                 tag = "warm" if warm else f"run{row['run']}"
