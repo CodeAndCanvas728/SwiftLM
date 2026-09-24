@@ -1834,7 +1834,7 @@ func handleChatCompletion(
     let emitPrefillProgress = prefillProgressEnabled(in: request)
 
     // ── Merge per-request overrides with CLI defaults ──
-    let tokenLimit = chatReq.maxTokens ?? config.maxTokens
+    let tokenLimit = chatReq.maxTokens ?? chatReq.maxCompletionTokens ?? config.maxTokens
     let temperature = chatReq.temperature.map(Float.init) ?? config.temp
     let topP = chatReq.topP.map(Float.init) ?? config.topP
     let topK = chatReq.topK ?? config.topK ?? 50
@@ -3717,6 +3717,10 @@ struct ChatCompletionRequest: Decodable {
     let messages: [Message]
     let stream: Bool?
     let maxTokens: Int?
+    /// OpenAI's current name for `max_tokens` (which it deprecated). Clients that send
+    /// only this, e.g. pi for any provider it does not recognise, were silently capped
+    /// at the server's `--max-tokens` instead.
+    let maxCompletionTokens: Int?
     let temperature: Double?
     let topP: Double?
     let topK: Int?
@@ -3741,6 +3745,7 @@ struct ChatCompletionRequest: Decodable {
     enum CodingKeys: String, CodingKey {
         case model, messages, stream, temperature, tools, stop, seed
         case maxTokens = "max_tokens"
+        case maxCompletionTokens = "max_completion_tokens"
         case topP = "top_p"
         case topK = "top_k"
         case minP = "min_p"
