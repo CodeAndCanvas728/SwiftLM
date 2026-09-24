@@ -1189,6 +1189,13 @@ struct MLXServer: AsyncParsableCommand {
             // Same lenient pass as above: no template, or context the probe lacks.
         }
 
+        // mlx-swift-lm's concurrent loader materializes every tensor in the
+        // checkpoint before `sanitize` runs, so tensors the model drops (e.g. a
+        // vision tower when loading text-only) are freed into MLX's buffer cache.
+        // With --stream-experts the cache limit is the SSD budget, so those
+        // buffers would otherwise stay resident for the life of the server.
+        Memory.clearCache()
+
         print("[SwiftLM] Model loaded. Starting HTTP server on \(host):\(port)")
 
         // ── Capture CLI defaults into a shared config ──
@@ -1962,6 +1969,18 @@ func handleChatCompletion(
                         break
                     case .summary(let summary):
                         print("[SwiftLM] DFlash summary: \(summary.generationTokens) tokens, \(String(format: "%.1f", summary.tokensPerSecond)) tok/s, acceptance=\(String(format: "%.1f%%", summary.acceptanceRatio * 100)), \(summary.cyclesCompleted) cycles")
+                        // The SSE/non-streaming handlers emit finish_reason, usage and
+                        // `[DONE]` from `.info`. Without it, a DFlash run that ends on EOS
+                        // or max_tokens (rather than a textual stop sequence) closes the
+                        // stream with no `[DONE]` sentinel.
+                        let prefillSec = summary.phaseTimingsUs.prefill / 1_000_000.0
+                        continuation.yield(.info(GenerateCompletionInfo(
+                            promptTokenCount: summary.promptTokenCount,
+                            generationTokenCount: summary.generationTokens,
+                            promptTime: prefillSec,
+                            generationTime: summary.elapsedUs / 1_000_000.0 - prefillSec,
+                            stopReason: summary.generationTokens >= tokenLimit ? .length : .stop
+                        )))
                     }
                 }
                 continuation.finish()
