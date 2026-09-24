@@ -307,7 +307,9 @@ def write_markdown(path, args, rows):
             if k not in keys:
                 keys.append(k)
         for cfg, ctx in keys:
-            group = [r for r in rows if (r["config"], r["context"]) == (cfg, ctx) and not r.get("warmup")]
+            every = [r for r in rows if (r["config"], r["context"]) == (cfg, ctx)]
+            # A case that aborted during its warm-up has no measured rows; report the warm-up.
+            group = [r for r in every if not r.get("warmup")] or every
             bad = [r for r in group if r.get("status") != "OK"]
             if bad:
                 f.write(f"| {cfg} | {ctx} | — | — | — | {bad[0].get('peak_gpu_gb', '—')} | "

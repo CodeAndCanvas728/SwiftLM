@@ -31,6 +31,14 @@ struct ModelProfile: Sendable {
     let numActiveExperts: Int?
     let weightFileSizeBytes: Int
     let modelId: String
+    /// Attention layout from `layer_types`. When a config has no `layer_types`,
+    /// every layer counts as full attention, which is the old estimate.
+    var fullAttentionLayers: Int? = nil
+    var slidingAttentionLayers: Int = 0
+    var slidingWindow: Int? = nil
+    /// Gemma 4 gives its full-attention layers their own KV head count and head dim.
+    var globalKVHeads: Int? = nil
+    var globalHeadDim: Int? = nil
 
     /// Estimated total parameters in billions (rough)
     var estimatedParamsB: Double {
@@ -55,10 +63,19 @@ struct ModelProfile: Sendable {
 
     /// KV cache memory in GB for a given context length
     func kvCacheMemoryGB(contextLength: Int) -> Double {
-        // KV cache = 2 (K + V) × layers × kv_heads × head_dim × context × 2 bytes (FP16)
+        // KV cache = 2 (K + V) × layers × kv_heads × head_dim × tokens × 2 bytes (FP16).
+        // Only attention layers hold a KV cache. Linear-attention layers (GatedDeltaNet)
+        // keep a fixed-size state instead, and sliding-window layers stop growing at the
+        // window size. Counting every layer as full attention overestimated Gemma 4 by
+        // ~10× and Qwen3.5/3.8 by ~4×, which pushed 32 GB machines into CPU
+        // partitioning they didn't need.
         let bytesPerElement = 2 // FP16
-        let kvBytes = 2 * numLayers * numKVHeads * headDim * contextLength * bytesPerElement
-        return Double(kvBytes) / 1e9
+        let fullLayers = fullAttentionLayers ?? numLayers
+        let fullBytes = 2 * fullLayers * (globalKVHeads ?? numKVHeads) * (globalHeadDim ?? headDim)
+            * contextLength * bytesPerElement
+        let slidingTokens = min(contextLength, slidingWindow ?? contextLength)
+        let slidingBytes = 2 * slidingAttentionLayers * numKVHeads * headDim * slidingTokens * bytesPerElement
+        return Double(fullBytes + slidingBytes) / 1e9
     }
 
     /// Total memory required in GB (weights + KV cache + overhead)
@@ -177,6 +194,10 @@ enum ModelProfiler {
         let vocabSize: Int?
         let quantizationConfig: QuantConfig?
         let textConfig: TextConfig?
+        let layerTypes: [String]?
+        let slidingWindow: Int?
+        let numGlobalKeyValueHeads: Int?
+        let globalHeadDim: Int?
 
         enum CodingKeys: String, CodingKey {
             case modelType = "model_type"
@@ -189,6 +210,10 @@ enum ModelProfiler {
             case vocabSize = "vocab_size"
             case quantizationConfig = "quantization_config"
             case textConfig = "text_config"
+            case layerTypes = "layer_types"
+            case slidingWindow = "sliding_window"
+            case numGlobalKeyValueHeads = "num_global_key_value_heads"
+            case globalHeadDim = "global_head_dim"
         }
     }
 
@@ -200,6 +225,10 @@ enum ModelProfiler {
         let headDim: Int?
         let intermediateSize: Int?
         let vocabSize: Int?
+        let layerTypes: [String]?
+        let slidingWindow: Int?
+        let numGlobalKeyValueHeads: Int?
+        let globalHeadDim: Int?
 
         enum CodingKeys: String, CodingKey {
             case numHiddenLayers = "num_hidden_layers"
@@ -209,6 +238,10 @@ enum ModelProfiler {
             case headDim = "head_dim"
             case intermediateSize = "intermediate_size"
             case vocabSize = "vocab_size"
+            case layerTypes = "layer_types"
+            case slidingWindow = "sliding_window"
+            case numGlobalKeyValueHeads = "num_global_key_value_heads"
+            case globalHeadDim = "global_head_dim"
         }
     }
 
@@ -275,7 +308,8 @@ enum ModelProfiler {
         // Measure weight file sizes on disk (only for MoE to avoid slow walks on dense models)
         let weightSize = isMoE ? measureWeightFiles(directory: modelDirectory) : 0
 
-        return ModelProfile(
+        let layerTypes = config.layerTypes ?? config.textConfig?.layerTypes
+        var profile = ModelProfile(
             modelType: modelType,
             numLayers: numLayers,
             hiddenSize: hiddenSize,
@@ -291,6 +325,22 @@ enum ModelProfiler {
             weightFileSizeBytes: weightSize,
             modelId: modelId
         )
+        if let layerTypes, layerTypes.count == numLayers {
+            // Anything that isn't sliding or linear attention is treated as full attention.
+            let sliding = layerTypes.filter { $0 == "sliding_attention" }.count
+            let linear = layerTypes.filter { $0 == "linear_attention" }.count
+            profile.slidingAttentionLayers = sliding
+            profile.fullAttentionLayers = layerTypes.count - sliding - linear
+            profile.slidingWindow = config.slidingWindow ?? config.textConfig?.slidingWindow
+            if sliding > 0 && profile.slidingWindow == nil {
+                // Can't cap a window we don't know, so count those layers as full.
+                profile.fullAttentionLayers = layerTypes.count - linear
+                profile.slidingAttentionLayers = 0
+            }
+        }
+        profile.globalKVHeads = config.numGlobalKeyValueHeads ?? config.textConfig?.numGlobalKeyValueHeads
+        profile.globalHeadDim = config.globalHeadDim ?? config.textConfig?.globalHeadDim
+        return profile
     }
 
     /// Routed-expert count keys, in precedence order within a container.
