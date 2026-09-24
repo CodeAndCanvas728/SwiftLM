@@ -205,6 +205,28 @@ private struct TransformersTokenizerBridge: MLXLMCommon.Tokenizer, Sendable {
 
 /// Returns `nil` when the value must be dropped (JSON `null` / NSNull), otherwise a
 /// structure with every nested null removed. See `TransformersTokenizerBridge.applyChatTemplate`.
+/// True when a VLM load failed because the checkpoint doesn't match the VLM code:
+/// its config doesn't decode, its weights don't line up with the module tree, or the
+/// factory doesn't know the model/processor type. Only these justify retrying an
+/// auto-detected VLM as a text-only LLM. Anything else (cancellation, download, I/O)
+/// would fail the same way again and just hide the real error.
+func isVLMCheckpointMismatch(_ error: any Error) -> Bool {
+    switch error {
+    case is DecodingError, is UpdateError:
+        return true
+    case let factoryError as ModelFactoryError:
+        switch factoryError {
+        case .unsupportedModelType, .unsupportedProcessorType, .configurationDecodingError,
+            .invalidConfiguration:
+            return true
+        default:
+            return false
+        }
+    default:
+        return false
+    }
+}
+
 func sanitizeForJinja(_ value: any Sendable) -> (any Sendable)? {
     if value is NSNull { return nil }
     let mirror = Mirror(reflecting: value)
@@ -904,11 +926,12 @@ struct MLXServer: AsyncParsableCommand {
                 ) { progress in
                     tracker.printProgress(progress)
                 }
-            } catch where !self.vision {
-                // Vision was only auto-detected. A checkpoint whose vision side
-                // doesn't load (e.g. a preprocessor_config.json without
-                // image_mean) can still serve text, so fall back rather than exit.
-                // With an explicit --vision, the error still propagates.
+            } catch where !self.vision && isVLMCheckpointMismatch(error) {
+                // Vision was only auto-detected, and the vision side of the checkpoint
+                // doesn't match the VLM code (e.g. a preprocessor_config.json without
+                // image_mean). The text model can still serve, so fall back rather than
+                // exit. Cancellation, network and I/O errors still propagate, as does
+                // any error under an explicit --vision.
                 print("[SwiftLM] ⚠️  Auto-detected VLM failed to load (\(error)); loading as a text-only LLM. Pass --vision to make this fatal.")
                 isVision = false
                 container = try await LLMModelFactory.shared.loadContainer(
