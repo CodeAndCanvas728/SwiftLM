@@ -864,7 +864,7 @@ struct MLXServer: AsyncParsableCommand {
         let speculativeDecodingRequested = self.draftModel != nil || self.dflash || self.mtp
         let autoDetectedVision = !self.audio && architecture.supportsVision
             && !speculativeDecodingRequested
-        let isVision = self.vision || autoDetectedVision
+        var isVision = self.vision || autoDetectedVision
         if architecture.supportsVision, !self.vision, !self.audio, speculativeDecodingRequested {
             print(
                 "[SwiftLM] Note: \(architecture.modelType ?? "unknown") reports vision support, but speculative/MTP decoding was requested; loading as a text-only LLM."
@@ -896,12 +896,28 @@ struct MLXServer: AsyncParsableCommand {
             }
         } else if isVision {
             print("[SwiftLM] Loading VLM (vision-language model)...")
-            container = try await VLMModelFactory.shared.loadContainer(
-                from: downloader,
-                using: TransformersTokenizerLoader(modelId: resolvedModelId),
-                configuration: modelConfig
-            ) { progress in
-                tracker.printProgress(progress)
+            do {
+                container = try await VLMModelFactory.shared.loadContainer(
+                    from: downloader,
+                    using: TransformersTokenizerLoader(modelId: resolvedModelId),
+                    configuration: modelConfig
+                ) { progress in
+                    tracker.printProgress(progress)
+                }
+            } catch where !self.vision {
+                // Vision was only auto-detected. A checkpoint whose vision side
+                // doesn't load (e.g. a preprocessor_config.json without
+                // image_mean) can still serve text, so fall back rather than exit.
+                // With an explicit --vision, the error still propagates.
+                print("[SwiftLM] ⚠️  Auto-detected VLM failed to load (\(error)); loading as a text-only LLM. Pass --vision to make this fatal.")
+                isVision = false
+                container = try await LLMModelFactory.shared.loadContainer(
+                    from: downloader,
+                    using: TransformersTokenizerLoader(modelId: resolvedModelId),
+                    configuration: modelConfig
+                ) { progress in
+                    tracker.printProgress(progress)
+                }
             }
         } else if isAudio {
             print("[SwiftLM] Loading ALM (audio-language model)...")
