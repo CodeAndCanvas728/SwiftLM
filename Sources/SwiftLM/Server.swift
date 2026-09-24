@@ -2333,6 +2333,27 @@ let forwardPrefillProgress: @Sendable (Int, Int) -> Void = { processed, total in
     activePrefillProgressHook?(processed, total)
 }
 
+/// Emits an SSE comment every `interval` until the stream terminates or the task is
+/// cancelled.
+///
+/// Without it a stream can sit silent for minutes on slow hardware: through a long
+/// prefill (the progress heartbeat is opt-in) and while a tool call is buffered, since
+/// no delta is sent until it parses. Node/Bun clients abort a body idle for ~300 s
+/// (`terminated`), and the agent's retry re-pays the whole prefill. SSE parsers ignore
+/// comment lines, so this is safe for every client. Each yield is a complete event, so
+/// a comment can never land inside another event.
+func startSSEKeepalive(
+    _ cont: AsyncStream<String>.Continuation, interval: Duration = .seconds(5)
+) -> Task<Void, Never> {
+    Task {
+        while !Task.isCancelled {
+            try? await Task.sleep(for: interval)
+            guard !Task.isCancelled else { return }
+            if case .terminated = cont.yield(": keepalive\r\n\r\n") { return }
+        }
+    }
+}
+
 func handleChatStreaming(
     startGeneration: @escaping () async throws -> (AsyncStream<Generation>, (() async -> Void)?),
     modelId: String,
@@ -2388,6 +2409,7 @@ func handleChatStreaming(
     // liveness so a long prefill cannot trip the client's idle timeout
     // (e.g. Bun fetch's 10s) into an ECONNRESET-and-retry loop.
     cont.yield(": connected\r\n\r\n")
+    let keepaliveTask = startSSEKeepalive(cont)
 
     let consumerTask: Task<Void, Never> = Task {
         var hasToolCalls = false
@@ -2410,6 +2432,7 @@ func handleChatStreaming(
         // generation slot is returned on ALL exit paths (normal completion,
         // startGeneration failure, client disconnect, or task cancellation).
         defer {
+            keepaliveTask.cancel()
             heartbeatTask?.cancel()
             heartbeatTask = nil
             activePrefillProgressHook = nil
@@ -2969,6 +2992,7 @@ func handleTextStreaming(
     }
     // First byte before any model work — same liveness guarantee as the chat path.
     cont.yield(": connected\r\n\r\n")
+    let keepaliveTask = startSSEKeepalive(cont)
     let consumerTask: Task<Void, Never> = Task {
         var completionTokenCount = 0
         var fullText = ""
@@ -2981,6 +3005,7 @@ func handleTextStreaming(
         // Unconditional cleanup: cancels the heartbeat and returns the generation
         // slot on ALL exit paths (completion, startGeneration failure, disconnect).
         defer {
+            keepaliveTask.cancel()
             heartbeatTask?.cancel()
             heartbeatTask = nil
             activePrefillProgressHook = nil
