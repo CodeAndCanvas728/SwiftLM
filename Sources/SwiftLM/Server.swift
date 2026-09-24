@@ -771,7 +771,8 @@ struct MLXServer: AsyncParsableCommand {
             // Apply memory strategy
             switch plan.strategy {
             case .fullGPU:
-                print("[SwiftLM] \(plan.strategy.emoji) Memory strategy: FULL GPU (\(String(format: "%.1f", plan.weightMemoryGB))GB model, \(String(format: "%.1f", system.availableRAMGB))GB available)")
+                Memory.cacheLimit = plan.recommendedCacheLimit
+                print("[SwiftLM] \(plan.strategy.emoji) Memory strategy: FULL GPU (\(String(format: "%.1f", plan.weightMemoryGB))GB model, \(String(format: "%.1f", system.availableRAMGB))GB available, cache limited to \(plan.recommendedCacheLimit / (1024*1024))MB)")
             case .swapAssisted:
                 if self.streamExperts {
                     // SSD Streaming: expert weights are mmap'd from SSD via the OS page cache.

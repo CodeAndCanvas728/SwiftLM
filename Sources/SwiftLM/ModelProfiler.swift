@@ -505,7 +505,15 @@ enum ModelProfiler {
         switch strategy {
         case .fullGPU:
             memoryLimit = Int(Double(system.recommendedWorkingSetBytes) * 1.5)
-            cacheLimit = system.recommendedWorkingSetBytes // default
+            // MLX's default cache limit is the whole working set. Prefill chunk
+            // buffers change shape as the KV offset grows, so they are rarely
+            // reused and the cache just keeps growing. On a 32 GB machine that
+            // pushed macOS into swap by ~8K tokens. Give the cache half of what
+            // is left after weights, KV and an 8 GB OS reserve, and never more
+            // than the old default.
+            let headroomGB = system.totalRAMGB - (weightGB + draftGB) - kvGB - 8.0
+            let budget = Int(max(1.0, headroomGB / 2) * 1e9)
+            cacheLimit = min(system.recommendedWorkingSetBytes, budget)
         case .swapAssisted:
             memoryLimit = 200 * 1024 * 1024 * 1024 // 200 GB sentinel to bypass MLX eval_impl spin loop (let macOS swap handle it)
             cacheLimit = 2 * 1024 * 1024 // 2MB — let OS manage caching
