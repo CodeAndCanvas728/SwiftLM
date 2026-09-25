@@ -227,6 +227,11 @@ func isVLMCheckpointMismatch(_ error: any Error) -> Bool {
     }
 }
 
+/// One-shot flags for TurboKV configuration notices.
+enum TurboKVNotice {
+    nonisolated(unsafe) static var warnedNoLayers = false
+}
+
 func sanitizeForJinja(_ value: any Sendable) -> (any Sendable)? {
     if value is NSNull { return nil }
     let mirror = Mirror(reflecting: value)
@@ -1287,6 +1292,9 @@ struct MLXServer: AsyncParsableCommand {
         let turboKVStr = config.turboKV ? "enabled" : "disabled"
         let mtpStr = config.mtp ? "enabled (\(config.numMtpTokens) tokens/round)" : "disabled"
         print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), mtp=\(mtpStr)")
+        if config.turboKV, let ctx = config.ctxSize {
+            print("[SwiftLM] ⚠️  --turbo-kv has no effect with --ctx-size \(ctx): a bounded context gives the attention layers a RotatingKVCache, and TurboKV only compresses KVCacheSimple. Drop --ctx-size to use --turbo-kv.")
+        }
 
         // ── Build Hummingbird router ──
         let router = Router()
@@ -2038,10 +2046,17 @@ func handleChatCompletion(
         // This compresses cache history older than 8192 tokens into 3.5-bit Polar+QJL
         // form, halving KV RAM for long-context (100k+) requests.
         if config.turboKV {
+            var enabledLayers = 0
             for layer in cache {
                 if let simple = layer as? KVCacheSimple {
                     simple.turboQuantEnabled = true
+                    enabledLayers += 1
                 }
+            }
+            if enabledLayers == 0 && !TurboKVNotice.warnedNoLayers {
+                // Warn once. A benign race here only means a duplicate log line.
+                TurboKVNotice.warnedNoLayers = true
+                print("[SwiftLM] ⚠️  --turbo-kv is enabled but this model's cache has no KVCacheSimple layers (\(cache.count) layers, e.g. RotatingKVCache from --ctx-size), so no KV compression is applied.")
             }
         }
 
