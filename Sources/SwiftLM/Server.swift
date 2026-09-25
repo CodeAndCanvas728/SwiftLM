@@ -781,9 +781,11 @@ struct MLXServer: AsyncParsableCommand {
         }
         
         var partitionPlan: PartitionPlan?
+        var modelIsMoE = false
         if let modelDir = modelDirectory {
            let profile = mainModelProfile ?? ModelProfiler.profile(modelDirectory: modelDir, modelId: modelId)
            if let profile = profile {
+            modelIsMoE = profile.isMoE
             let system = ModelProfiler.systemProfile()
             let contextSize = self.ctxSize ?? 4096
             let plan = ModelProfiler.plan(model: profile, system: system, contextSize: contextSize, draftWeightBytes: draftFootprintBytes)
@@ -1132,6 +1134,12 @@ struct MLXServer: AsyncParsableCommand {
                 let total = partitionPlan?.totalLayers ?? actual
                 let cpuCount = total - actual
                 print("[SwiftLM] 🔀 Layer split active: \(actual) GPU / \(cpuCount) CPU")
+                if modelIsMoE && cpuCount > 0 {
+                    // CPU-resident MoE layers run the quantized expert matmuls on a
+                    // single core (~0.4 tok/s prefill on Gemma 4 26B-A4B, see #176).
+                    print("[SwiftLM] ⚠️  \(cpuCount) MoE layers will run on the CPU, which is very slow (expect well under 1 tok/s).")
+                    print("[SwiftLM]    For MoE models that don't fit in GPU memory, prefer --stream-experts over --gpu-layers.")
+                }
                 // Update the partition plan to reflect actual split
                 partitionPlan?.gpuLayers = actual
             } else {
