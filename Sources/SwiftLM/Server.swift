@@ -1837,7 +1837,7 @@ func handleChatCompletion(
         )
     }
 
-    let params = GenerateParameters(
+    var generateParams = GenerateParameters(
         maxTokens: tokenLimit,
         maxKVSize: config.ctxSize,
         kvBits: chatReq.kvBits,
@@ -1848,6 +1848,8 @@ func handleChatCompletion(
         repetitionPenalty: repeatPenalty,
         prefillStepSize: config.prefillSize
     )
+    generateParams.prefill.progress = forwardPrefillProgress
+    let params = generateParams
 
     // ── Seed for deterministic generation ──
     if let seed = chatReq.seed {
@@ -2290,7 +2292,17 @@ actor PrefillState {
     private(set) var done: Bool = false
     private(set) var nPast: Int = 0
     func finish() { done = true }
-    func update(nPast: Int) { self.nPast = nPast }
+    // Updates arrive as detached Tasks and can land out of order.
+    func update(nPast: Int) { self.nPast = max(self.nPast, nPast) }
+}
+
+/// Routes `PrefillParameters.progress` into `activePrefillProgressHook`.
+/// Only the LLM `prepare` calls the hook directly; VLM `prepare` reports
+/// chunked prefill through `prefill.progress`, so without this the heartbeat's
+/// n_past stays 0 on the VLM path. The hook is read at call time, so the
+/// per-request hook installed by the streaming handlers is the one that fires.
+let forwardPrefillProgress: @Sendable (Int, Int) -> Void = { processed, total in
+    activePrefillProgressHook?(processed, total)
 }
 
 func handleChatStreaming(
@@ -2842,7 +2854,7 @@ func handleTextCompletion(
     let repeatPenalty = compReq.repetitionPenalty.map(Float.init) ?? config.repeatPenalty
     let stopSequences = compReq.stop ?? []
 
-    let params = GenerateParameters(
+    var generateParams = GenerateParameters(
         maxTokens: tokenLimit,
         maxKVSize: config.ctxSize,
         temperature: temperature,
@@ -2852,6 +2864,8 @@ func handleTextCompletion(
         repetitionPenalty: repeatPenalty,
         prefillStepSize: config.prefillSize
     )
+    generateParams.prefill.progress = forwardPrefillProgress
+    let params = generateParams
 
     if let seed = compReq.seed {
         MLXRandom.seed(UInt64(seed))
