@@ -5,7 +5,7 @@ Streams one chat completion and prints the text live. While it runs it samples
 the server's physical footprint and system swap, then prints a stats line. The
 figures come from this run, not from the benchmark files.
 
-usage: stream_client.py short
+usage: stream_client.py warmup | short
        stream_client.py long <n_filler_lines>
 """
 import json, re, subprocess, sys, threading, time, urllib.request
@@ -36,7 +36,11 @@ def swap_gb():
 
 def main():
     kind = sys.argv[1]
-    if kind == "short":
+    if kind == "warmup":
+        # The first request after load pays one-off Metal pipeline/compile costs.
+        prompt = "Count from 1 to 8, comma-separated."
+        max_tokens = 24
+    elif kind == "short":
         prompt = "Write a Swift function `fib(_ n: Int) -> Int` that returns the n-th Fibonacci number iteratively. Code only, with a one-line doc comment."
         max_tokens = 160
     else:
@@ -111,7 +115,7 @@ def main():
     sys.stdout.write(RESET + "\n\n")
     decode = (n_tok - 1) / (t_end - t_first) if n_tok > 1 else 0
     ttft = t_first - t0
-    pf = f" prompt {n_prompt:,} tok · prefill {n_prompt / ttft:.0f} tok/s ·" if n_prompt and kind != "short" else ""
+    pf = f" prompt {n_prompt:,} tok · prefill {n_prompt / ttft:.0f} tok/s ·" if n_prompt and kind == "long" else ""
     print(f"{CYAN}{BOLD}  {n_tok} tokens · decode {decode:.1f} tok/s · TTFT {ttft:.1f}s ·{pf.rstrip(' ·')}{RESET}")
     print(f"{CYAN}{BOLD}  peak SwiftLM {peak_fp[0]:.1f} GB · swap +{max(0, peak_swap[0]):.1f} GB{RESET}")
 
