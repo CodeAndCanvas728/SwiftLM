@@ -173,4 +173,28 @@ final class ServerSSETests: XCTestCase {
         XCTAssertEqual(err["type"] as? String, "server_error")
         XCTAssertEqual(err["code"] as? String, "internal_error")
     }
+
+    // MARK: - Keepalive
+
+    /// A silent stream (long prefill, buffered tool call) must still carry bytes, as
+    /// SSE comments that parsers ignore, or Node/Bun clients abort it after ~300 s.
+    func testKeepaliveEmitsSSECommentsWhileStreamIsSilent() async {
+        let (stream, cont) = AsyncStream<String>.makeStream()
+        let task = startSSEKeepalive(cont, interval: .milliseconds(20))
+        var received: [String] = []
+        for await event in stream {
+            received.append(event)
+            if received.count == 2 { break }
+        }
+        task.cancel()
+        XCTAssertEqual(received, [": keepalive\r\n\r\n", ": keepalive\r\n\r\n"])
+    }
+
+    func testKeepaliveStopsWhenStreamFinishes() async {
+        let (_, cont) = AsyncStream<String>.makeStream()
+        let task = startSSEKeepalive(cont, interval: .milliseconds(10))
+        cont.finish()
+        // Returns on its own (yield reports .terminated), without being cancelled.
+        await task.value
+    }
 }
