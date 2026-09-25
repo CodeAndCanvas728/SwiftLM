@@ -641,9 +641,23 @@ struct MLXServer: AsyncParsableCommand {
         // hand-copied or huggingface-cli model it returns nil — which skipped the MoE
         // guard *and* the ExpertStreamingConfig activation while still setting lazyLoad,
         // i.e. lazy weights with no streamer (the #112 memory shape) and no diagnostic.
-        let modelDirectory =
+        var modelDirectory =
             ModelStorage.validatedContentDirectory(for: modelId)
             ?? resolveModelDirectory(modelId: modelId)
+        if self.streamExperts, modelDirectory == nil,
+            !FileManager.default.fileExists(atPath: modelId)
+        {
+            // First run: fetch now so streaming is activated for this load. Otherwise the
+            // loader downloads it later and loads every expert into memory. Same hub root
+            // as the loader below, so it reuses these files.
+            print("[SwiftLM] --stream-experts: downloading \(modelId) before loading...")
+            let hub = HubApi(
+                downloadBase: URL.applicationSupportDirectory
+                    .appendingPathComponent("MLX", isDirectory: true)
+                    .appendingPathComponent("HuggingFace", isDirectory: true))
+            modelDirectory = try await hub.snapshot(
+                from: modelId, matching: ["*.safetensors", "*.json", "*.jinja"])
+        }
         var mainModelProfile: ModelProfile? = nil
         if self.streamExperts, let dir = modelDirectory {
             mainModelProfile = ModelProfiler.profile(modelDirectory: dir, modelId: modelId)
