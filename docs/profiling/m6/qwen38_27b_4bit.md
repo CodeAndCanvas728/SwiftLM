@@ -1,5 +1,7 @@
 ### `mlx-community/Qwen3.8-27B-4bit`
 
+> **Correction (Sep 24):** the `TurboKV` rows below were run with `--ctx-size`, which on mlx-swift-lm 460ff81 gives the attention layers a `RotatingKVCache`, and `--turbo-kv` only applies to `KVCacheSimple`. So these rows are effectively vanilla, not TurboKV. See #175 for real TurboKV behaviour.
+
 Apple M6 · 32 GB · runs=3 (long=1) · warmup=1 · gen=128 · temperature 0 · medians
 
 | Config | Context (prompt tok) | Prefill tok/s | TTFT s | Decode tok/s | Peak GPU GB | Swap Δ GB | Min free % | Checks |

@@ -78,15 +78,15 @@ The first SwiftLM numbers from a **32 GB** Mac. Every other table in this README
 
 ### Gemma-4-26B-A4B 4-bit — by prompt length
 
-| Prompt tokens | Vanilla prefill / decode (tok/s) | TTFT | `--turbo-kv` prefill / decode (tok/s) | Peak GPU · swap growth |
-|---|---|---|---|---|
-| ~530 | 733 / **52.2** | 0.8 s | 785 / 53.2 | 14.5 GB · 0 |
-| ~2.3K | **963** / 50.2 | 2.5 s | 969 / 50.5 | 15.0 GB · 0 |
-| ~9.5K | 959 / 45.1 | 10.1 s | 971 / 45.5 | 15.8 GB · 0 |
-| ~39.7K | 757 / 31.0 | 53.3 s | 787 / 31.5 | 17.9 GB · 0 |
-| ~80.7K | 622 / 24.3 | 131.3 s | 630 / 24.5 | 19.5 GB · 0 |
+| Prompt tokens | Prefill / decode (tok/s) | TTFT | Peak GPU · swap growth |
+|---|---|---|---|
+| ~530 | 733 / **52.2** | 0.8 s | 14.5 GB · 0 |
+| ~2.3K | **963** / 50.2 | 2.5 s | 15.0 GB · 0 |
+| ~9.5K | 959 / 45.1 | 10.1 s | 15.8 GB · 0 |
+| ~39.7K | 757 / 31.0 | 53.3 s | 17.9 GB · 0 |
+| ~80.7K | 622 / 24.3 | 131.3 s | 19.5 GB · 0 |
 
-Every needle check passed in both modes. `--mtp` with the bf16 assistant (`gemma-4-26B-A4B-it-assistant-bf16`) works but is slower on the M6: 45.2 / 35.6 / 30.4 tok/s decode at ~530 / 2.3K / 9.5K tokens, against 53.0 / 50.8 / 46.0 without it. A 4-bit MoE is compute-bound, so verifying the drafted tokens costs more than it saves (the same finding as the M5 Pro tables below).
+Every needle check passed. `--mtp` with the bf16 assistant (`gemma-4-26B-A4B-it-assistant-bf16`) works but is slower on the M6: 45.2 / 35.6 / 30.4 tok/s decode at ~530 / 2.3K / 9.5K tokens, against 53.0 / 50.8 / 46.0 without it. A 4-bit MoE is compute-bound, so verifying the drafted tokens costs more than it saves (the same finding as the M5 Pro tables below).
 
 ### Qwen3.6-35B-A3B 4-bit — GPU vs SSD streaming
 
@@ -97,16 +97,16 @@ Every needle check passed in both modes. `--mtp` with the bf16 assistant (`gemma
 | ~9.8K | 849 / 43.4 | 21.1 GB | 403 / 12.9 | 6.6 GB |
 | 40.8K | 635 / 35.1 | 22.4 GB | 340 / 11.9 | 7.7 GB |
 
-### Qwen3.8-27B-4bit (dense) — Vanilla vs TurboKV
+### Qwen3.8-27B-4bit (dense)
 
-| Prompt tokens | Vanilla prefill / decode (tok/s) | TurboKV prefill / decode (tok/s) | Peak GPU · swap growth |
-|---|---|---|---|
-| ~550 | 233 / 9.3 | 231 / 9.3 | 15.2 GB · 0 |
-| ~2.3K | 242 / 9.1 | 261 / 9.2 | 16.1 GB · 0 |
-| ~9.8K | 238 / 8.9 | 250 / 8.9 | 16.9 GB · 0 |
-| ~40.8K | 200 / 7.9 | 202 / 7.9 | 18.4 GB · 0 (TurboKV 16.9 GB) |
+| Prompt tokens | Prefill / decode (tok/s) | Peak GPU · swap growth |
+|---|---|---|
+| ~550 | 233 / 9.3 | 15.2 GB · 0 |
+| ~2.3K | 242 / 9.1 | 16.1 GB · 0 |
+| ~9.8K | 238 / 8.9 | 16.9 GB · 0 |
+| ~40.8K | 200 / 7.9 | 18.4 GB · 0 |
 
-TurboKV barely changes speed on this model. Only 16 of its 64 layers use full attention (the other 48 are GatedDeltaNet), so the KV cache is already small. It saves about 1.5 GB at 40K tokens.
+> **Correction:** an earlier version of these tables had `--turbo-kv` columns. Those runs passed `--ctx-size`, which on this mlx-swift-lm pin gives the attention layers a `RotatingKVCache`, and `--turbo-kv` only applies to `KVCacheSimple`. They were really vanilla runs, so the columns were removed.
 
 ### What 32 GB exposed
 
@@ -121,7 +121,7 @@ TurboKV barely changes speed on this model. Only 16 of its 64 layers use full at
 3. **An auto-detected VLM that failed to load exited the server.** `Qwen3.6-35B-A3B-UD-MLX-4bit` ships a `preprocessor_config.json` without `image_mean`. SwiftLM now falls back to text-only unless you pass `--vision`.
 4. **Vision-capable models skipped chunked prefill.** On the older mlx-swift-lm pin, a text-only prompt on the VLM path ran through the model in a single pass. It's fixed by the mlx-swift-lm bump in #167. Every number in this section was measured on `main` with that bump.
 
-> ⚠️ **`--turbo-kv` precision on M5 (not reproduced on M6):** on an Apple M5, Qwen3.8-27B-4bit with `--turbo-kv` gets exact long-range lookups wrong from somewhere between 2K and 5K prompt tokens. Asked how many numbered lines a prompt has, it answers "1,000" or "14" instead of 315 / 500 / 700. Without `--turbo-kv` it answers correctly, and on the M6 both modes are 24/24 correct from 2K to 11.8K tokens with the same prompt. The likely cause is a GPU-family-dependent path in TurboKV's dequant or attention kernels. Until it's fixed, avoid `--turbo-kv` on M5 when exact recall matters. Tracked in [#175](https://github.com/SharpAI/SwiftLM/issues/175).
+> ⚠️ **`--turbo-kv` loses exact long-range recall on every chip:** once a prompt passes the 2,048-token compression threshold, Qwen3.8-27B-4bit with `--turbo-kv` gets exact lookups wrong. Asked how many numbered lines a prompt has, it answers "1,000", "1,314" or "14" instead of 315 / 500 / 700. Reproduced on both M5 and M6; without `--turbo-kv` it answers correctly. The cause is a cache-eviction bookkeeping regression: after compression, attention only sees the recent hot window, and positions restart. A fix is in progress; tracked in [#175](https://github.com/SharpAI/SwiftLM/issues/175). Until then, avoid `--turbo-kv` when exact recall matters. Also note that `--turbo-kv` currently has no effect when `--ctx-size` is set (the attention layers use `RotatingKVCache`).
 >
 > ⚠️ **Known issues:** `--gpu-layers N` (CPU/GPU layer partitioning) hits a Metal GPU timeout on the first request, on both M5 and M6 (repro: `--model mlx-community/gemma-4-26b-a4b-it-4bit --gpu-layers 23`). Tracked in [#176](https://github.com/SharpAI/SwiftLM/issues/176); the fix is [SharpAI/mlx-swift#17](https://github.com/SharpAI/mlx-swift/pull/17). Even once it's fixed, CPU-resident MoE layers are very slow (~0.4 tok/s prefill), so on a 32 GB Mac try `--stream-experts` first (Qwen3.6-35B-A3B: 13.2 tok/s decode, 7.7 GB GPU). QAT-quantized Gemma 4 MTP assistants (`…-qat-assistant-4bit`) fail with `unhandledKeys pre_projection/post_projection`; use `gemma-4-26B-A4B-it-assistant-bf16`.
 
