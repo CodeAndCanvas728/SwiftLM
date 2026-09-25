@@ -964,6 +964,9 @@ struct MLXServer: AsyncParsableCommand {
             }
         }
 
+        // Final after the VLM→LLM fallback above; later closures capture this `let`.
+        let loadedAsVision = isVision
+
         print("[SwiftLM] Loaded model configuration. Inferred tool call format: \(String(describing: await container.configuration.toolCallFormat))")
 
         // ── Check if target model supports DFlash ──
@@ -1052,12 +1055,14 @@ struct MLXServer: AsyncParsableCommand {
                 print("[SwiftLM]    Ignoring --mtp-assistant-model; generation will not use MTP.")
             } else {
                 // The assistant drafts *for* this trunk, so it needs a reference to it.
+                let assistant = mtpAssistantModelRef
                 await container.perform { mainContext in
-                    mtpAssistantModelRef?.mainModelRef = mainContext.model
+                    assistant?.mainModelRef = mainContext.model
                 }
                 print("[SwiftLM] MTP assistant ready (\(self.numMtpTokens) tokens/round)")
             }
         }
+        let loadedMTPAssistant = mtpAssistantModelRef
 
         // ── Load DFlash draft model for block-diffusion speculative decoding ──
         let dflashModel: DFlashDraftModel?
@@ -1249,7 +1254,7 @@ struct MLXServer: AsyncParsableCommand {
             minP: self.minP,
             repeatPenalty: self.repeatPenalty,
             thinking: self.thinking,
-            isVision: isVision,
+            isVision: loadedAsVision,
             prefillSize: self.prefillSize,
             turboKV: self.turboKV,
             mtp: self.mtp,
@@ -1334,7 +1339,7 @@ struct MLXServer: AsyncParsableCommand {
                 }
             }
             let payload = """
-{"status":"ok","model":"\(modelId)","vision":\(isVision),"memory":{"active_mb":\(activeMemMB),"peak_mb":\(peakMemMB),"cache_mb":\(cacheMemMB),"total_system_mb":\(totalMemMB),"gpu_architecture":"\(deviceInfo.architecture)"},"stats":{"requests_total":\(snapshot.requestsTotal),"requests_active":\(snapshot.requestsActive),"tokens_generated":\(snapshot.tokensGenerated),"avg_tokens_per_sec":\(String(format: "%.2f", snapshot.avgTokensPerSec))}\(partitionJson)}
+{"status":"ok","model":"\(modelId)","vision":\(loadedAsVision),"memory":{"active_mb":\(activeMemMB),"peak_mb":\(peakMemMB),"cache_mb":\(cacheMemMB),"total_system_mb":\(totalMemMB),"gpu_architecture":"\(deviceInfo.architecture)"},"stats":{"requests_total":\(snapshot.requestsTotal),"requests_active":\(snapshot.requestsActive),"tokens_generated":\(snapshot.tokensGenerated),"avg_tokens_per_sec":\(String(format: "%.2f", snapshot.avgTokensPerSec))}\(partitionJson)}
 """
             return Response(
                 status: .ok,
@@ -1365,7 +1370,7 @@ struct MLXServer: AsyncParsableCommand {
                     draftModelRef: draftModelRef, numDraftTokens: numDraftTokensConfig,
                     dflashModel: dflashModel, dflashBlockSize: dflashBlockSizeConfig,
                     dflashTargetModel: dflashTargetModel,
-                    mtpAssistant: mtpAssistantModelRef
+                    mtpAssistant: loadedMTPAssistant
                 )
             } catch {
                 return Response(
@@ -1465,7 +1470,7 @@ struct MLXServer: AsyncParsableCommand {
             "port": port,
             "model": modelId,
             "engine": "mlx",
-            "vision": isVision
+            "vision": loadedAsVision
         ]
         if let plan = partitionPlan {
             var info = plan.healthInfo
