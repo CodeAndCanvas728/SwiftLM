@@ -390,6 +390,21 @@ final class ProgressTracker {
 /// for a protocol-critical signal the daemon is meant to positively rely
 /// on (not just infer), a dropped emit with zero diagnostic trail would be
 /// hard to ever notice. Logs to stderr on failure instead.
+/// Ends the process after a requested shutdown (SIGTERM/SIGINT) without running
+/// C++ static destructors or `atexit` handlers.
+///
+/// `exit()` tears those down while an inference thread may still be inside an MLX
+/// GPU eval, so a shutdown during generation crashed (SIGSEGV in
+/// `CustomKernel::eval_gpu`'s kernel map, or SIGABRT) right after the
+/// `exiting{reason:"requested"}` event: the daemon saw a crash report and a
+/// non-zero status for a clean stop. Nothing needs those destructors at this
+/// point; stdout/stderr are flushed so the exiting event and logs are not lost.
+func exitAfterShutdownRequest() -> Never {
+    fflush(stdout)
+    fflush(stderr)
+    Darwin._exit(0)
+}
+
 func emitEvent(_ payload: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: payload),
           let json = String(data: data, encoding: .utf8)
@@ -1560,12 +1575,12 @@ struct MLXServer: AsyncParsableCommand {
         shutdownSource.setEventHandler {
             print("\n[SwiftLM] Received SIGTERM, shutting down gracefully...")
             emitEvent(["event": "exiting", "reason": "requested"])
-            Darwin.exit(0)
+            exitAfterShutdownRequest()
         }
         interruptSource.setEventHandler {
             print("\n[SwiftLM] Received SIGINT, shutting down gracefully...")
             emitEvent(["event": "exiting", "reason": "requested"])
-            Darwin.exit(0)
+            exitAfterShutdownRequest()
         }
         shutdownSource.resume()
         interruptSource.resume()
