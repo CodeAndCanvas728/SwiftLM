@@ -97,7 +97,7 @@ Every needle check passed. `--mtp` with the bf16 assistant (`gemma-4-26B-A4B-it-
 | ~9.8K | 858 / 43.4 | 20.4 GB | 401 / 12.7 | 5.6 GB |
 | 40.8K | 615 / 36.1 | 21.5 GB | 336 / 12.0 | 5.8 GB |
 
-> ⚠️ **`--stream-experts` crashes on Qwen3.5/3.6 in release b769** (`broadcast_shapes … (N,8,8,2048)` on the first request). The mlx-swift-lm upstream sync in #167 broke the SSD path. Earlier versions of this table were measured before that sync and were never re-checked afterwards. Fixed in SharpAI/mlx-swift-lm#69 and #71; the table above was re-measured with those fixes.
+> ⚠️ **`--stream-experts` crashes on Qwen3.5/3.6 in releases b769 and b773** (`broadcast_shapes … (N,8,8,2048)` on the first request). The mlx-swift-lm upstream sync in #167 broke the SSD path. Earlier versions of this table were measured before that sync and were never re-checked afterwards. Fixed in SharpAI/mlx-swift-lm#69 and #71; the table above was re-measured with those fixes.
 
 ### Qwen3.8-27B-4bit (dense)
 
