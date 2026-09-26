@@ -90,6 +90,8 @@ Every needle check passed. `--mtp` with the bf16 assistant (`gemma-4-26B-A4B-it-
 
 ### Qwen3.6-35B-A3B 4-bit — GPU vs SSD streaming
 
+![Qwen3.6-35B-A3B with --stream-experts on release b782: 13.6 tok/s decode, 5.1 GB peak, no swap, on a base Mac mini M6 32 GB](docs/profiling/m6/media/m6_qwen36_35b_a3b_ssd_stream.gif)
+
 | Prompt tokens | GPU prefill / decode (tok/s) | GPU peak | `--stream-experts` prefill / decode (tok/s) | SSD peak |
 |---|---|---|---|---|
 | ~550 | 714 / 47.0 | 19.8 GB | 256 / 13.2 | 5.6 GB |
