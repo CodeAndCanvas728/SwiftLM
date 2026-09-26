@@ -973,6 +973,9 @@ struct MLXServer: AsyncParsableCommand {
 
         // Final after the VLM→LLM fallback above; later closures capture this `let`.
         let loadedAsVision = isVision
+        if loadedAsVision || isAudio {
+            print("[SwiftLM] Note: the prompt cache is not used for VLM/Omni loads; each text request re-prefills its full prompt.")
+        }
 
         print("[SwiftLM] Loaded model configuration. Inferred tool call format: \(String(describing: await container.configuration.toolCallFormat))")
 
@@ -2132,7 +2135,15 @@ func handleChatCompletion(
         // Skip prompt cache for quantized-KV requests: the prompt cache stores KV state
         // produced with KVCacheSimple; restoring it into a QuantizedKVCache (or vice-versa)
         // is unsafe and produces incorrect results or runtime failures.
-        let skipPromptCache = isMultimodalRequest || params.kvBits != nil
+        //
+        // Skip it for VLM/Omni-loaded models too. Their processors mostly return [1, T]
+        // tokens, which the axis-0 slices below mishandle (a generic hit re-feeds the whole
+        // prompt on top of the restored KV), and models such as Qwen3.5/Qwen3-VL need the
+        // LMOutput.State (ropeDeltas) of the cached prefix, which the prompt cache does not
+        // store. Checked on the model type rather than config.isVision so --audio
+        // (OmniModelFactory) loads are covered as well.
+        let isVLM = context.model is any VLMModel
+        let skipPromptCache = isMultimodalRequest || params.kvBits != nil || isVLM
 
         // ── Hybrid (recurrent + attention) prompt cache ──
         // Qwen3.5/3.6-style models pair MambaCache (linear attention) with KVCacheSimple
@@ -2227,6 +2238,8 @@ func handleChatCompletion(
             // The hybrid path already saved at its boundary; a save here would capture
             // recurrent state one decode token too late.
             guard hybridBoundary == nil else { return }
+            // Nothing would ever restore it (see skipPromptCache above).
+            guard !isVLM else { return }
             if turboHasCompressed {
                 print("[SwiftLM] 🧠 Skipping prompt cache save — TurboQuant has compressed \(cache.compactMap { ($0 as? KVCacheSimple)?.compressedOffset }.max() ?? 0) tokens. Saving would decode ~37 GB back to fp16.")
             } else if params.kvBits != nil {
