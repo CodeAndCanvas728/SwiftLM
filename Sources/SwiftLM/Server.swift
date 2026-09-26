@@ -277,6 +277,7 @@ final class ProgressTracker {
     private var lastUpdate: TimeInterval = 0
     private var lastBytes: Int64 = 0
     private var speedStr = "0.0 MB/s"
+    private var progress: Progress?
     
     init(modelId: String) {
         self.modelId = modelId
@@ -291,6 +292,11 @@ final class ProgressTracker {
         isDone = true
         trackingTask?.cancel()
         if Self.barOpen {
+            // The Task may be cancelled before its last frame; show where it ended.
+            if let progress {
+                print(frame(fraction: progress.fractionCompleted).padding(
+                    toLength: 100, withPad: " ", startingAt: 0), terminator: "")
+            }
             print("")
             fflush(stdout)
             Self.barOpen = false
@@ -320,7 +326,37 @@ final class ProgressTracker {
         return sumDir(modelHubDir) + sumDir(downloadDir)
     }
     
+    /// One `\r` frame of the download bar at `fraction`.
+    private func frame(fraction: Double) -> String {
+        let pct = Int(fraction * 100)
+        var completedMB = String(format: "%.1f", Double(self.lastBytes) / 1_048_576)
+        var totalMB = "???"
+        if fraction > 0.001 {
+            let extrapolated = (Double(self.lastBytes) / fraction) / 1_048_576.0
+            totalMB = String(format: "%.1f", extrapolated)
+        } else if fraction == 0.0 {
+             completedMB = "0.0"
+        }
+        
+        let barLength = 20
+        let completedBars = min(barLength, Int(fraction * Double(barLength)))
+        let emptyBars = max(0, barLength - completedBars)
+        
+        var bars = ""
+        if completedBars > 0 {
+            bars += String(repeating: "=", count: completedBars - 1) + ">"
+        }
+        bars += String(repeating: " ", count: emptyBars)
+        
+        let pctStr = String(format: "%3d%%", pct)
+        let spinner = self.spinnerFrames[self.frameIndex]
+        let speedText = "| Speed: \(self.speedStr)"
+        
+        return String(format: "\r[SwiftLM] Download: [%@] %@ %@ (%@ MB / %@ MB) %@", bars, pctStr, spinner, completedMB, totalMB, speedText)
+    }
+
     func printProgress(_ progress: Progress) {
+        self.progress = progress
         if trackingTask == nil {
             lastUpdate = Date().timeIntervalSince1970
             lastBytes = getDownloadedBytes()
@@ -329,7 +365,6 @@ final class ProgressTracker {
                 while !self.isDone && !Task.isCancelled {
                     let now = Date().timeIntervalSince1970
                     let fraction = progress.fractionCompleted
-                    let pct = Int(fraction * 100)
                     
                     let interval = now - self.lastUpdate
                     if interval >= 0.25 {
@@ -348,30 +383,7 @@ final class ProgressTracker {
                         self.lastUpdate = now
                     }
                     
-                    var completedMB = String(format: "%.1f", Double(self.lastBytes) / 1_048_576)
-                    var totalMB = "???"
-                    if fraction > 0.001 {
-                        let extrapolated = (Double(self.lastBytes) / fraction) / 1_048_576.0
-                        totalMB = String(format: "%.1f", extrapolated)
-                    } else if fraction == 0.0 {
-                         completedMB = "0.0"
-                    }
-                    
-                    let barLength = 20
-                    let completedBars = min(barLength, Int(fraction * Double(barLength)))
-                    let emptyBars = max(0, barLength - completedBars)
-                    
-                    var bars = ""
-                    if completedBars > 0 {
-                        bars += String(repeating: "=", count: completedBars - 1) + ">"
-                    }
-                    bars += String(repeating: " ", count: emptyBars)
-                    
-                    let pctStr = String(format: "%3d%%", pct)
-                    let spinner = self.spinnerFrames[self.frameIndex]
-                    let speedText = "| Speed: \(self.speedStr)"
-                    
-                    let msg = String(format: "\r[SwiftLM] Download: [%@] %@ %@ (%@ MB / %@ MB) %@", bars, pctStr, spinner, completedMB, totalMB, speedText)
+                    let msg = self.frame(fraction: fraction)
                     
                     if self.isDone { break }
                     print(msg.padding(toLength: 100, withPad: " ", startingAt: 0), terminator: "")
@@ -437,6 +449,24 @@ func emitEvent(_ payload: [String: Any]) {
     }
     print(json)
     fflush(stdout)
+}
+
+/// A `--stream-experts` prefetch finished without every weight shard on disk,
+/// for example offline with a partial copy.
+struct ModelDownloadIncomplete: LocalizedError {
+    let modelId: String
+    let directory: URL
+    var errorDescription: String? {
+        "Download of \(modelId) is incomplete (\(directory.path)). Check the network, or delete the directory and retry."
+    }
+}
+
+/// Whether `directory` has the files `TransformersTokenizerLoader` reads.
+func hasTokenizerFiles(in directory: URL) -> Bool {
+    let fm = FileManager.default
+    return fm.fileExists(atPath: directory.appendingPathComponent("tokenizer_config.json").path)
+        && (fm.fileExists(atPath: directory.appendingPathComponent("tokenizer.json").path)
+            || fm.fileExists(atPath: directory.appendingPathComponent("vocab.json").path))
 }
 
 /// Where `run()` is when it throws, so `classifyExitReason` can produce a more
@@ -698,9 +728,11 @@ struct MLXServer: AsyncParsableCommand {
                     .appendingPathComponent("MLX", isDirectory: true)
                     .appendingPathComponent("HuggingFace", isDirectory: true))
             let localRepo = hub.localRepoLocation(Hub.Repo(id: modelId))
-            // Every shard must be present: an interrupted download (or the config.json
-            // the architecture probe fetches) would otherwise plan with a partial size.
-            if FileManager.default.fileExists(atPath: localRepo.path),
+            // Reuse only a copy a finished snapshot left behind. Shards alone are not
+            // enough: an interrupted download can still be missing tokenizer or template
+            // files, and the loader won't fill them in when it reads a directory.
+            let completeMarker = localRepo.appendingPathComponent(".swiftlm-snapshot-complete")
+            if FileManager.default.fileExists(atPath: completeMarker.path),
                 ModelStorage.validateLocalModelDirectory(localRepo)
             {
                 modelDirectory = localRepo
@@ -710,17 +742,20 @@ struct MLXServer: AsyncParsableCommand {
                 print("[SwiftLM] --stream-experts: downloading \(modelId) before loading...")
                 let prefetchTracker = ProgressTracker(modelId: modelId)
                 defer { prefetchTracker.finish() }
-                modelDirectory = try await hub.snapshot(
+                let snapshot = try await hub.snapshot(
                     from: modelId, matching: ["*.safetensors", "*.json", "*.jinja"]
                 ) { progress in
                     prefetchTracker.printProgress(progress)
                 }
+                // Offline, snapshot returns the repo directory even when it is partial.
+                guard ModelStorage.validateLocalModelDirectory(snapshot),
+                    hasTokenizerFiles(in: snapshot)
+                else {
+                    throw ModelDownloadIncomplete(modelId: modelId, directory: snapshot)
+                }
+                FileManager.default.createFile(atPath: completeMarker.path, contents: nil)
+                modelDirectory = snapshot
             }
-        }
-        // Streaming is activated for `modelDirectory`, and only a load of that exact
-        // directory streams. Load from it, or a different lookup could pick another copy.
-        if self.streamExperts, let dir = modelDirectory {
-            modelConfig = ModelConfiguration(directory: dir)
         }
         var mainModelProfile: ModelProfile? = nil
         if self.streamExperts, let dir = modelDirectory {
@@ -737,6 +772,13 @@ struct MLXServer: AsyncParsableCommand {
                 print("[SwiftLM]    If this model *is* MoE, please report it — see issue #112.")
                 self.streamExperts = false
             }
+        }
+
+        // Streaming is activated for `modelDirectory`, and only a load of that exact
+        // directory streams. Load from it, or a different lookup could pick another copy.
+        // Keep the id when tokenizer files are missing, so the loader can fetch them.
+        if self.streamExperts, let dir = modelDirectory, hasTokenizerFiles(in: dir) {
+            modelConfig = ModelConfiguration(directory: dir)
         }
 
         // Inject streaming flag into config to bypass eval(model) if requested
