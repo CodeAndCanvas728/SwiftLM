@@ -641,9 +641,35 @@ struct MLXServer: AsyncParsableCommand {
         // hand-copied or huggingface-cli model it returns nil — which skipped the MoE
         // guard *and* the ExpertStreamingConfig activation while still setting lazyLoad,
         // i.e. lazy weights with no streamer (the #112 memory shape) and no diagnostic.
-        let modelDirectory =
+        var modelDirectory =
             ModelStorage.validatedContentDirectory(for: modelId)
             ?? resolveModelDirectory(modelId: modelId)
+        if self.streamExperts, !self.info, modelDirectory == nil,
+            !FileManager.default.fileExists(atPath: modelId)
+        {
+            // Streaming must be activated for the directory the loader reads, so resolve it
+            // before loading. Same hub root as the loader below, which reuses these files.
+            let hub = HubApi(
+                downloadBase: URL.applicationSupportDirectory
+                    .appendingPathComponent("MLX", isDirectory: true)
+                    .appendingPathComponent("HuggingFace", isDirectory: true))
+            let localRepo = hub.localRepoLocation(Hub.Repo(id: modelId))
+            if FileManager.default.fileExists(
+                atPath: localRepo.appendingPathComponent("config.json").path)
+            {
+                modelDirectory = localRepo
+            } else {
+                // First run. A failed download is a model problem, not a binary one.
+                phase = .architectureProbe
+                print("[SwiftLM] --stream-experts: downloading \(modelId) before loading...")
+                let prefetchTracker = ProgressTracker(modelId: modelId)
+                modelDirectory = try await hub.snapshot(
+                    from: modelId, matching: ["*.safetensors", "*.json", "*.jinja"]
+                ) { progress in
+                    prefetchTracker.printProgress(progress)
+                }
+            }
+        }
         var mainModelProfile: ModelProfile? = nil
         if self.streamExperts, let dir = modelDirectory {
             mainModelProfile = ModelProfiler.profile(modelDirectory: dir, modelId: modelId)
