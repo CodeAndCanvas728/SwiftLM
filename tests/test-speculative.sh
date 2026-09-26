@@ -231,18 +231,35 @@ T1='{"role":"user","content":"Say hi."}'
 T2="$T1"',{"role":"assistant","content":"Hi."},{"role":"user","content":"Say bye."}'
 for MSGS in "$T1" "$T2"; do
     N=$(echo "[$MSGS]" | jq length)
-    R=$(curl -sf --max-time 120 -X POST "$URL/v1/chat/completions" \
+    # No -f: keep the error body of a failed request, since the server does not log it.
+    R=$(curl -s --max-time 120 -w '\n%{http_code}' -X POST "$URL/v1/chat/completions" \
         -H "Content-Type: application/json" \
-        -d "{\"model\":\"$MAIN_MODEL\",\"max_tokens\":8,\"temperature\":0,\"messages\":[$MSGS]}" 2>/dev/null || echo "")
-    if echo "$R" | jq -e '.choices[0].finish_reason and .usage.prompt_tokens > 0' >/dev/null 2>&1; then
+        -d "{\"model\":\"$MAIN_MODEL\",\"max_tokens\":8,\"temperature\":0,\"messages\":[$MSGS]}" 2>/dev/null || true)
+    CODE="${R##*$'\n'}"
+    BODY="${R%$'\n'*}"
+    if [ "$CODE" = "200" ] \
+        && echo "$BODY" | jq -e '.choices[0].finish_reason and .usage.prompt_tokens > 0' >/dev/null 2>&1; then
         pass "No-draft VLM text chat, $N message(s): completed"
     else
-        fail "No-draft VLM text chat, $N message(s): no completion (${R:0:200})"
+        fail "No-draft VLM text chat, $N message(s): no completion (HTTP ${CODE:-none}: ${BODY:0:300})"
     fi
 done
-# Checked after the requests, which fflush stdout. Guards against this test silently
-# covering the LLM path (auto-detect off, or the VLM->LLM fallback, which still prints
-# the auto-detect line).
+# Stop with SIGTERM before reading the log, not cleanup()'s SIGKILL. stdout is a fully
+# buffered file here and a failing request never flushes it, so a "Prompt cache HIT" line
+# printed just before the error only reaches the log when the server exits normally.
+# If the server already died (a crash skips that flush too), the cache check below
+# cannot pass.
+SERVER_ALIVE=1
+kill -0 "$SERVER_PID" 2>/dev/null || SERVER_ALIVE=0
+kill -TERM "$SERVER_PID" 2>/dev/null || true
+for _ in $(seq 1 30); do
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 1
+done
+cleanup
+SERVER_PID=""
+# Guards against this test silently covering the LLM path (auto-detect off, or the
+# VLM->LLM fallback, which still prints the auto-detect line).
 if grep -q "Loading VLM (vision-language model)" "$LOG_FILE" \
     && ! grep -q "Auto-detected VLM failed to load" "$LOG_FILE"; then
     pass "No-draft: $MAIN_MODEL was loaded as a VLM"
@@ -253,6 +270,8 @@ fi
 # comes from the VLM server, which must bypass the cache.
 if grep -q "Prompt cache HIT" "$LOG_FILE"; then
     fail "No-draft: the VLM server restored from the prompt cache"
+elif [ "$SERVER_ALIVE" = 0 ]; then
+    fail "No-draft: the server exited during Test 7, so its log may be missing a prompt cache hit"
 else
     pass "No-draft: the VLM server bypassed the prompt cache"
 fi
