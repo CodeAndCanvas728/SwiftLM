@@ -69,7 +69,7 @@ The first SwiftLM numbers from a **32 GB** Mac. Every other table in this README
 | `Qwen3.6-35B-A3B-UD-MLX-4bit` | 21.6 GB | `--stream-experts` | 13.2 tok/s | 40.8K tokens | 5.8 GB |
 | `Qwen3.8-27B-4bit` (dense) | 11.3 GB | GPU | 9.3 tok/s | 40.8K tokens | 18.4 GB |
 | `gemma-4-26b-a4b-it-8bit` | ~26 GB | GPU | swaps (+3.1 GB on the first prompt) | — | — |
-| `gemma-4-26b-a4b-it-8bit` | ~26 GB | `--stream-experts` | 8.8 tok/s | 9.5K tokens (32K swapped) | 7.6 GB |
+| `gemma-4-26b-a4b-it-8bit` | ~26 GB | `--stream-experts` | 9.1 tok/s | 9.5K tokens (32K swapped) | 7.3 GB |
 
 - **MoE models are the sweet spot at 32 GB.** Only the active experts are read for each token, so they decode 5–6× faster than a dense 27B. A 4-bit MoE with up to about 22 GB of weights runs entirely on the GPU.
 - **Qwen3.6-35B-A3B on a base M6 reaches 76%** of the M1 Ultra 64 GB decode speed below (47.0 vs 61.7 tok/s).
@@ -97,7 +97,7 @@ Every needle check passed. `--mtp` with the bf16 assistant (`gemma-4-26B-A4B-it-
 | ~9.8K | 858 / 43.4 | 20.4 GB | 401 / 12.7 | 5.6 GB |
 | 40.8K | 615 / 36.1 | 21.5 GB | 336 / 12.0 | 5.8 GB |
 
-> ⚠️ **`--stream-experts` crashes on Qwen3.5/3.6 in releases b769 and b773** (`broadcast_shapes … (N,8,8,2048)` on the first request). The mlx-swift-lm upstream sync in #167 broke the SSD path. Earlier versions of this table were measured before that sync and were never re-checked afterwards. Fixed in SharpAI/mlx-swift-lm#69 and #71; the table above was re-measured with those fixes.
+> ⚠️ **`--stream-experts` crashes on quantized MoE models in releases b769 and b773** (`broadcast_shapes … (N,8,8,D)` on the first request). Reproduced on M6 with Qwen3.6-35B-A3B and Gemma 4 26B-A4B. The mlx-swift-lm upstream sync in #167 broke the SSD path. Earlier versions of this table were measured before that sync and were never re-checked afterwards. Fixed in SharpAI/mlx-swift-lm#69 and #71; the table above was re-measured with those fixes.
 
 ### Qwen3.8-27B-4bit (dense)
 
@@ -121,7 +121,7 @@ Every needle check passed. `--mtp` with the bf16 assistant (`gemma-4-26B-A4B-it-
 1. **The MLX buffer cache was unbounded on full-GPU loads.** It could grow to the whole 26.8 GB working set. It is now sized from the RAM left after weights and KV.
 2. **The KV-cache estimate counted every layer as full attention.** Gemma 4 (25 of 30 layers use a 1,024-token sliding window) was overestimated 10×, and Qwen3.5/3.8 (48 of 64 layers are linear attention) 4×. On 32 GB that pushed Gemma into CPU/GPU layer partitioning, which crashed with a Metal GPU timeout.
 3. **An auto-detected VLM that failed to load exited the server.** `Qwen3.6-35B-A3B-UD-MLX-4bit` ships a `preprocessor_config.json` without `image_mean`. SwiftLM now falls back to text-only unless you pass `--vision`.
-4. **Vision-capable models skipped chunked prefill.** On the older mlx-swift-lm pin, a text-only prompt on the VLM path ran through the model in a single pass. It's fixed by the mlx-swift-lm bump in #167. Every number in this section was measured on `main` after that bump; the Qwen3.6 table was re-measured with SharpAI/mlx-swift-lm#69 and #71.
+4. **Vision-capable models skipped chunked prefill.** On the older mlx-swift-lm pin, a text-only prompt on the VLM path ran through the model in a single pass. It's fixed by the mlx-swift-lm bump in #167. Every number in this section was measured on `main` after that bump. The `--stream-experts` rows (Qwen3.6 and Gemma 4 8-bit) were re-measured with SharpAI/mlx-swift-lm#69 and #71, because b769/b773 crash in that mode.
 
 > ℹ️ **`--turbo-kv` long-range recall is fixed** ([#175](https://github.com/SharpAI/SwiftLM/issues/175), SharpAI/mlx-swift-lm#65). Before the fix, once a prompt passed the 2,048-token compression threshold, attention only saw the recent hot window and positions restarted, so Qwen3.8-27B-4bit got exact lookups wrong. Attention now covers the compressed history too, which makes `--turbo-kv` slower than before (97 s vs 72 s on an 11.8K-token prompt on the M6). `--turbo-kv` still has no effect when `--ctx-size` is set (the attention layers use `RotatingKVCache`).
 >
