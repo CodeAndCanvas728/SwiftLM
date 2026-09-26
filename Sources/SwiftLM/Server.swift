@@ -281,6 +281,21 @@ final class ProgressTracker {
     init(modelId: String) {
         self.modelId = modelId
     }
+
+    /// True while a `\r` progress bar is on screen without its closing newline.
+    nonisolated(unsafe) static var barOpen = false
+
+    /// Stops redrawing and ends the bar's line, so later output (and the `exiting`
+    /// event, which the daemon parses per line) starts on a fresh line.
+    func finish() {
+        isDone = true
+        trackingTask?.cancel()
+        if Self.barOpen {
+            print("")
+            fflush(stdout)
+            Self.barOpen = false
+        }
+    }
     
     func getDownloadedBytes() -> Int64 {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -358,11 +373,14 @@ final class ProgressTracker {
                     
                     let msg = String(format: "\r[SwiftLM] Download: [%@] %@ %@ (%@ MB / %@ MB) %@", bars, pctStr, spinner, completedMB, totalMB, speedText)
                     
+                    if self.isDone { break }
                     print(msg.padding(toLength: 100, withPad: " ", startingAt: 0), terminator: "")
                     fflush(stdout)
-                    
+                    Self.barOpen = true
+
                     if fraction >= 1.0 {
                         print("")
+                        Self.barOpen = false
                         self.isDone = true
                         break
                     }
@@ -397,6 +415,10 @@ func emitEvent(_ payload: [String: Any]) {
         FileHandle.standardError.write(
             Data("[SwiftLM] failed to encode event for stdout: \(payload)\n".utf8))
         return
+    }
+    if ProgressTracker.barOpen {
+        print("")
+        ProgressTracker.barOpen = false
     }
     print(json)
     fflush(stdout)
@@ -644,6 +666,13 @@ struct MLXServer: AsyncParsableCommand {
         var modelDirectory =
             ModelStorage.validatedContentDirectory(for: modelId)
             ?? resolveModelDirectory(modelId: modelId)
+        // resolveModelDirectory doesn't check the weights are there; streaming must not be
+        // activated for an empty or partial snapshot the loader won't read.
+        if self.streamExperts, let dir = modelDirectory,
+            !ModelStorage.validateLocalModelDirectory(dir)
+        {
+            modelDirectory = nil
+        }
         if self.streamExperts, !self.info, modelDirectory == nil,
             !FileManager.default.fileExists(atPath: modelId)
         {
@@ -654,8 +683,10 @@ struct MLXServer: AsyncParsableCommand {
                     .appendingPathComponent("MLX", isDirectory: true)
                     .appendingPathComponent("HuggingFace", isDirectory: true))
             let localRepo = hub.localRepoLocation(Hub.Repo(id: modelId))
-            if FileManager.default.fileExists(
-                atPath: localRepo.appendingPathComponent("config.json").path)
+            // Every shard must be present: an interrupted download (or the config.json
+            // the architecture probe fetches) would otherwise plan with a partial size.
+            if FileManager.default.fileExists(atPath: localRepo.path),
+                ModelStorage.validateLocalModelDirectory(localRepo)
             {
                 modelDirectory = localRepo
             } else {
@@ -663,12 +694,18 @@ struct MLXServer: AsyncParsableCommand {
                 phase = .architectureProbe
                 print("[SwiftLM] --stream-experts: downloading \(modelId) before loading...")
                 let prefetchTracker = ProgressTracker(modelId: modelId)
+                defer { prefetchTracker.finish() }
                 modelDirectory = try await hub.snapshot(
                     from: modelId, matching: ["*.safetensors", "*.json", "*.jinja"]
                 ) { progress in
                     prefetchTracker.printProgress(progress)
                 }
             }
+        }
+        // Streaming is activated for `modelDirectory`, and only a load of that exact
+        // directory streams. Load from it, or a different lookup could pick another copy.
+        if self.streamExperts, let dir = modelDirectory {
+            modelConfig = ModelConfiguration(directory: dir)
         }
         var mainModelProfile: ModelProfile? = nil
         if self.streamExperts, let dir = modelDirectory {
@@ -937,6 +974,7 @@ struct MLXServer: AsyncParsableCommand {
             return self.model
         }()
         let tracker = ProgressTracker(modelId: resolvedModelId)
+        defer { tracker.finish() }
         
         let isAudio = self.audio
         phase = .mainModelLoad
@@ -1003,6 +1041,7 @@ struct MLXServer: AsyncParsableCommand {
             print("[SwiftLM] Note: the prompt cache is not used for VLM/Omni loads; each text request re-prefills its full prompt.")
         }
 
+        tracker.finish()
         print("[SwiftLM] Loaded model configuration. Inferred tool call format: \(String(describing: await container.configuration.toolCallFormat))")
 
         // ── Check if target model supports DFlash ──
