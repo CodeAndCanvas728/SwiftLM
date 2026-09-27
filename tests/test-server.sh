@@ -35,6 +35,10 @@ cleanup() {
         kill -9 "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
+    if [ -n "${TERM_SERVER_PID:-}" ]; then
+        kill -9 "$TERM_SERVER_PID" 2>/dev/null || true
+        wait "$TERM_SERVER_PID" 2>/dev/null || true
+    fi
     if [ -n "${CORS_SERVER_PID:-}" ]; then
         log "Stopping CORS server (PID $CORS_SERVER_PID)"
         kill -9 "$CORS_SERVER_PID" 2>/dev/null || true
@@ -1202,6 +1206,49 @@ else
 fi
 rm -f /tmp/mlx_ttfb_prompt.txt /tmp/mlx_ttfb_body.json /tmp/mlx_ttfb_stream.txt
 
+
+# ── Test 39: SIGTERM during generation exits cleanly ─────────────────
+# A shutdown request mid-stream must exit 0 with exiting{reason:"requested"} on its
+# own line, and must not crash (exit() used to race an in-flight GPU eval, #197).
+log "Test 39: SIGTERM during a streaming generation"
+TERM_PORT=$((PORT + 3))
+TERM_LOG=$(mktemp)
+TERM_STREAM=$(mktemp)
+TERM_MARK=$(mktemp)  # only crash reports written after this can be ours
+"$BINARY" --model "$MODEL" --port "$TERM_PORT" --host "$HOST" > "$TERM_LOG" 2>&1 &
+TERM_SERVER_PID=$!
+TERM_PID=$TERM_SERVER_PID
+for i in $(seq 1 120); do
+    curl -sf "http://${HOST}:${TERM_PORT}/health" >/dev/null 2>&1 && break
+    sleep 1
+done
+curl -sN -X POST "http://${HOST}:${TERM_PORT}/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"$MODEL\",\"stream\":true,\"max_tokens\":2048,\"messages\":[{\"role\":\"user\",\"content\":\"Write a very long story about a lighthouse keeper.\"}]}" \
+    > "$TERM_STREAM" 2>/dev/null &
+TERM_CURL_PID=$!
+for i in $(seq 1 200); do
+    grep -q '"content"' "$TERM_STREAM" 2>/dev/null && break
+    sleep 0.1
+done
+kill -TERM "$TERM_SERVER_PID"
+TERM_STATUS=0
+wait "$TERM_SERVER_PID" || TERM_STATUS=$?
+unset TERM_SERVER_PID
+kill "$TERM_CURL_PID" 2>/dev/null || true
+wait "$TERM_CURL_PID" 2>/dev/null || true
+
+TERM_REASON=$(grep '^{' "$TERM_LOG" | jq -r 'select(.event == "exiting") | .reason' 2>/dev/null | tail -1)
+sleep 3  # ReportCrash writes the .ips a moment after the process dies
+TERM_CRASHES=$(find "$HOME/Library/Logs/DiagnosticReports" -name 'SwiftLM*' -newer "$TERM_MARK" \
+    -exec grep -l "\"pid\" : ${TERM_PID}," {} + 2>/dev/null | wc -l | tr -d ' ')
+if [ "$TERM_STATUS" -eq 0 ] && [ "$TERM_REASON" = "requested" ] && [ "$TERM_CRASHES" -eq 0 ]; then
+    pass "SIGTERM mid-stream: exit 0, exiting{requested} on its own line, no crash report"
+else
+    fail "SIGTERM mid-stream: status=$TERM_STATUS reason='${TERM_REASON}' crash_reports=$TERM_CRASHES"
+    tail -5 "$TERM_LOG"
+fi
+rm -f "$TERM_LOG" "$TERM_STREAM" "$TERM_MARK"
 
 # ── Results ──────────────────────────────────────────────────────────
 echo ""

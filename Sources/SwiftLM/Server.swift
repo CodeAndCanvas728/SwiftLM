@@ -420,21 +420,6 @@ final class ProgressTracker {
 /// for a protocol-critical signal the daemon is meant to positively rely
 /// on (not just infer), a dropped emit with zero diagnostic trail would be
 /// hard to ever notice. Logs to stderr on failure instead.
-/// Ends the process after a requested shutdown (SIGTERM/SIGINT) without running
-/// C++ static destructors or `atexit` handlers.
-///
-/// `exit()` tears those down while an inference thread may still be inside an MLX
-/// GPU eval, so a shutdown during generation crashed (SIGSEGV in
-/// `CustomKernel::eval_gpu`'s kernel map, or SIGABRT) right after the
-/// `exiting{reason:"requested"}` event: the daemon saw a crash report and a
-/// non-zero status for a clean stop. Nothing needs those destructors at this
-/// point; stdout/stderr are flushed so the exiting event and logs are not lost.
-func exitAfterShutdownRequest() -> Never {
-    fflush(stdout)
-    fflush(stderr)
-    Darwin._exit(0)
-}
-
 func emitEvent(_ payload: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: payload),
           let json = String(data: data, encoding: .utf8)
@@ -449,6 +434,21 @@ func emitEvent(_ payload: [String: Any]) {
     }
     print(json)
     fflush(stdout)
+}
+
+/// Ends the process after a requested shutdown (SIGTERM/SIGINT) without running
+/// C++ static destructors or `atexit` handlers.
+///
+/// `exit()` tears those down while an inference thread may still be inside an MLX
+/// GPU eval, so a shutdown during generation crashed (SIGSEGV in
+/// `CustomKernel::eval_gpu`'s kernel map, or SIGABRT) right after the
+/// `exiting{reason:"requested"}` event: the daemon saw a crash report and a
+/// non-zero status for a clean stop. Nothing needs those destructors at this
+/// point; stdout/stderr are flushed so the exiting event and logs are not lost.
+func exitAfterShutdownRequest() -> Never {
+    fflush(stdout)
+    fflush(stderr)
+    Darwin._exit(0)
 }
 
 /// A `--stream-experts` prefetch finished without every weight shard on disk,
@@ -1647,7 +1647,7 @@ struct MLXServer: AsyncParsableCommand {
         // is already gone by the time a shutdown signal arrives (e.g. the
         // daemon itself already crashed), the exiting-event print()/fflush
         // below can raise SIGPIPE — whose default disposition kills this
-        // process via signal instead of reaching Darwin.exit(0), producing
+        // process via signal instead of reaching exitAfterShutdownRequest(), producing
         // exactly the ambiguous "was this a crash?" signature this feature
         // exists to eliminate. Ignore SIGPIPE so a closed pipe surfaces as
         // an ordinary EPIPE write error instead.
