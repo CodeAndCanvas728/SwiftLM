@@ -1,10 +1,8 @@
-// StreamingDirectory.swift — where a Hub model is loaded from, checked against the
-// Hub's own file list.
+// StreamingDirectory.swift — the directory `--stream-experts` loads a Hub model from.
 //
-// `--stream-experts` streams from the one directory it was activated for, and a
-// directory load doesn't fill in missing files. So the directory must be complete,
-// and "complete" is decided by what the Hub lists, not by guessing a shard layout
-// (repos ship `weights.NN.safetensors`, no index, or an index naming extra shards).
+// Streaming targets one directory, and a directory load doesn't fill in missing
+// files, so that copy must be loadable. Local copies are used as they are when they
+// have what the loader reads; the Hub is consulted only when none does.
 
 import Foundation
 import Hub
@@ -13,7 +11,7 @@ import MLXInferenceCore
 /// Files SwiftLM downloads for a model: weights, configs, tokenizer and templates.
 let modelDownloadPatterns = ["*.safetensors", "*.json", "*.jinja"]
 
-/// A `--stream-experts` prefetch finished without every listed file on disk.
+/// A `--stream-experts` download finished without the files the loader needs.
 struct ModelDownloadIncomplete: Error, CustomStringConvertible {
     let modelId: String
     let directory: URL
@@ -30,64 +28,22 @@ struct ModelMissingTokenizer: Error, CustomStringConvertible {
     }
 }
 
-/// The Hub couldn't be reached and there is no local copy known to be complete.
-struct ModelUnavailableOffline: Error, CustomStringConvertible {
-    let modelId: String
-    let underlying: Error
-    var description: String {
-        "Could not reach the Hub to fetch \(modelId) (\(underlying)), and no complete local copy was found."
-    }
-}
-
-/// The Hub answered, but has no repository `modelId` this user can read.
+/// The Hub answered 401/404 and there is no loadable local copy.
 struct ModelNotOnHub: Error, CustomStringConvertible {
     let modelId: String
     let underlying: Error
     var description: String {
-        "The Hub has no accessible repository \(modelId) (\(underlying)). Check the id, or log in for a gated model."
+        "The Hub has no accessible repository \(modelId) (\(underlying)), and no loadable local copy was found. Check the id, or set HF_TOKEN for a private repository."
     }
 }
 
-struct HubListingTimeout: Error, CustomStringConvertible {
-    var description: String { "the Hub did not answer in time" }
-}
-
-/// The Hub's file list for a repository, or why there isn't one.
-enum HubListing {
-    case files([String])
-    /// A network error or timeout; the Hub gave no answer.
-    case unreachable(Error)
-}
-
-/// Asks the Hub which files `modelId` has. Throws only when the Hub answered with
-/// an error (unknown or gated repository); connectivity problems are `.unreachable`.
-func fetchHubListing(_ hub: HubApi, modelId: String) async throws -> HubListing {
-    do {
-        let files = try await withThrowingTaskGroup(of: [String].self) { group in
-            group.addTask { try await hub.getFilenames(from: modelId, matching: modelDownloadPatterns) }
-            group.addTask {
-                try await Task.sleep(nanoseconds: 15_000_000_000)
-                throw HubListingTimeout()
-            }
-            defer { group.cancelAll() }
-            return try await group.next()!
-        }
-        return .files(files)
-    } catch let error as Hub.HubClientError {
-        switch error {
-        case .httpStatusCode, .authorizationRequired, .resourceNotFound, .fileNotFound:
-            throw ModelNotOnHub(modelId: modelId, underlying: error)
-        default:
-            return .unreachable(error)
-        }
-    } catch {
-        return .unreachable(error)
+/// The Hub couldn't be used and there is no loadable local copy.
+struct ModelUnavailableOffline: Error, CustomStringConvertible {
+    let modelId: String
+    let underlying: Error
+    var description: String {
+        "Could not get \(modelId) from the Hub (\(underlying)), and no loadable local copy was found."
     }
-}
-
-/// Listed files that are absent from `directory`.
-func missingFiles(_ files: [String], in directory: URL) -> [String] {
-    files.filter { !FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path) }
 }
 
 /// Whether `directory` has `tokenizer.json`. swift-transformers requires it;
@@ -96,62 +52,91 @@ func hasTokenizerJSON(in directory: URL) -> Bool {
     FileManager.default.fileExists(atPath: directory.appendingPathComponent("tokenizer.json").path)
 }
 
+/// Whether the loader can read `directory` as a model: `config.json`, `tokenizer.json`,
+/// and weights. With an index, every shard it names; without one, any top-level
+/// `*.safetensors` (`model.safetensors`, `weights.00.safetensors`, ...).
+func hasLoadableModelFiles(in directory: URL) -> Bool {
+    let fm = FileManager.default
+    func nonEmpty(_ name: String) -> Bool {
+        let url = directory.appendingPathComponent(name).resolvingSymlinksInPath()
+        let size = (try? fm.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        return size > 0
+    }
+    guard nonEmpty("config.json"), nonEmpty("tokenizer.json") else { return false }
+    let index = directory.appendingPathComponent("model.safetensors.index.json")
+    if let data = try? Data(contentsOf: index),
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let weightMap = json["weight_map"] as? [String: String]
+    {
+        return Set(weightMap.values).allSatisfy(nonEmpty)
+    }
+    let names = (try? fm.contentsOfDirectory(atPath: directory.path)) ?? []
+    return names.contains { $0.hasSuffix(".safetensors") && nonEmpty($0) }
+}
+
+/// Whether a Hub error means the repository isn't available to this user.
+private func isNotOnHub(_ error: Error) -> Bool {
+    guard let hubError = error as? Hub.HubClientError else { return false }
+    switch hubError {
+    case .authorizationRequired, .resourceNotFound: return true
+    case .httpStatusCode(let code): return code == 401 || code == 404
+    default: return false
+    }
+}
+
 /// The directory `--stream-experts` loads and streams `modelId` from.
 ///
-/// Online, a local copy (`candidate`, then the loader's Application Support copy)
-/// is used only if it has every listed file; otherwise the model is downloaded and
-/// must then have them all. Offline, only a copy known to be complete is used.
-func resolveStreamingDirectory(
-    modelId: String, candidate: URL?, hub: HubApi, listing: HubListing
-) async throws -> URL {
+/// A loadable local copy (`candidate`, then the loader's Application Support copy)
+/// is used without contacting the Hub. Otherwise the model is downloaded into the
+/// Application Support copy, which must then have every top-level listed file.
+func resolveStreamingDirectory(modelId: String, candidate: URL?, hub: HubApi) async throws -> URL {
     let fm = FileManager.default
     let localRepo = hub.localRepoLocation(Hub.Repo(id: modelId))
-    // Records that this copy once matched the Hub listing, for offline starts.
-    let marker = localRepo.appendingPathComponent(".swiftlm-snapshot-complete")
+    // Present while a download into localRepo is unfinished; that copy isn't trusted.
+    let inProgress = localRepo.appendingPathComponent(".swiftlm-download-in-progress")
     let copies = [candidate, localRepo].compactMap { $0 }.filter { fm.fileExists(atPath: $0.path) }
+    let loadable = copies.filter {
+        hasLoadableModelFiles(in: $0) && !($0 == localRepo && fm.fileExists(atPath: inProgress.path))
+    }
+    if let dir = loadable.first { return dir }
 
-    switch listing {
-    case .files(let files):
-        guard files.contains("tokenizer.json") else { throw ModelMissingTokenizer(modelId: modelId) }
-        for dir in copies {
-            let missing = missingFiles(files, in: dir)
-            if missing.isEmpty {
-                if dir == localRepo { fm.createFile(atPath: marker.path, contents: nil) }
-                return dir
-            }
-            print("[SwiftLM] \(dir.path) is missing \(missing.count) of \(files.count) files (e.g. \(missing[0])).")
-        }
-        // A dense model won't stream: leave completing it to the loader instead of
-        // downloading everything here first.
-        if let dir = copies.first(where: {
-            fm.fileExists(atPath: $0.appendingPathComponent("config.json").path)
-        }), let profile = ModelProfiler.profile(modelDirectory: dir, modelId: modelId), !profile.isMoE {
-            return dir
-        }
+    let files: [String]
+    do {
+        files = try await hub.getFilenames(from: modelId, matching: modelDownloadPatterns)
+    } catch where isNotOnHub(error) {
+        throw ModelNotOnHub(modelId: modelId, underlying: error)
+    } catch {
+        throw ModelUnavailableOffline(modelId: modelId, underlying: error)
+    }
+    guard files.contains("tokenizer.json") else { throw ModelMissingTokenizer(modelId: modelId) }
 
-        print("[SwiftLM] --stream-experts: downloading \(modelId) before loading...")
-        let tracker = ProgressTracker(modelId: modelId)
-        defer { tracker.finish() }
-        let snapshot = try await hub.snapshot(from: modelId, matching: modelDownloadPatterns) {
-            tracker.printProgress($0)
-        }
-        tracker.finish()
-        guard missingFiles(files, in: snapshot).isEmpty else {
-            throw ModelDownloadIncomplete(modelId: modelId, directory: snapshot)
-        }
-        fm.createFile(atPath: marker.path, contents: nil)
-        return snapshot
-
-    case .unreachable(let error):
-        let verified = fm.fileExists(atPath: marker.path) && hasTokenizerJSON(in: localRepo)
-            ? [localRepo] : []
-        let plausible = copies.filter {
-            hasTokenizerJSON(in: $0) && ModelStorage.validateLocalModelDirectory($0, logFailures: false)
-        }
-        guard let dir = (verified + plausible).first else {
-            throw ModelUnavailableOffline(modelId: modelId, underlying: error)
-        }
-        print("[SwiftLM] ⚠️  Could not reach the Hub to check \(modelId) (\(error)); using \(dir.path).")
+    // A dense model won't stream: leave completing it to the loader instead of
+    // downloading everything here first.
+    if let dir = copies.first(where: {
+        fm.fileExists(atPath: $0.appendingPathComponent("config.json").path)
+    }), let profile = ModelProfiler.profile(modelDirectory: dir, modelId: modelId), !profile.isMoE {
         return dir
     }
+    for dir in copies {
+        let reason = dir == localRepo && fm.fileExists(atPath: inProgress.path)
+            ? "its download didn't finish" : "missing weights or tokenizer.json"
+        print("[SwiftLM] \(dir.path) can't be loaded as is (\(reason)).")
+    }
+
+    print("[SwiftLM] --stream-experts: downloading \(modelId) before loading...")
+    try fm.createDirectory(at: localRepo, withIntermediateDirectories: true)
+    fm.createFile(atPath: inProgress.path, contents: nil)
+    let tracker = ProgressTracker(modelId: modelId)
+    defer { tracker.finish() }
+    let snapshot = try await hub.snapshot(from: modelId, matching: modelDownloadPatterns) {
+        tracker.printProgress($0)
+    }
+    tracker.finish()
+    let topLevel = files.filter { !$0.contains("/") }
+    let missing = topLevel.filter { !fm.fileExists(atPath: snapshot.appendingPathComponent($0).path) }
+    guard missing.isEmpty, hasLoadableModelFiles(in: snapshot) else {
+        throw ModelDownloadIncomplete(modelId: modelId, directory: snapshot)
+    }
+    try? fm.removeItem(at: inProgress)
+    return snapshot
 }

@@ -674,30 +674,12 @@ struct MLXServer: AsyncParsableCommand {
                 .appendingPathComponent("HuggingFace", isDirectory: true))
         let isHubId = !ModelStorage.isLocalDirectoryPath(modelId)
             && !FileManager.default.fileExists(atPath: modelId)
-        let validatedLocal = isHubId ? ModelStorage.validatedContentDirectory(for: modelId) : nil
-        // A copy whose download stopped after the shards still validates, so check local
-        // copies against the Hub's file list. --stream-experts needs the list anyway, and
-        // a Hub error there (unknown or gated id) fails the start.
-        var hubListing: HubListing? = nil
-        if isHubId, !self.info, self.streamExperts || validatedLocal != nil {
-            phase = .architectureProbe
-            hubListing = self.streamExperts
-                ? try await fetchHubListing(cliHub, modelId: modelId)
-                : try? await fetchHubListing(cliHub, modelId: modelId)
-        }
-        var validatedLocalMissing: [String] = []
-        if let dir = validatedLocal, case .files(let files)? = hubListing {
-            validatedLocalMissing = missingFiles(files, in: dir)
-        }
 
         var modelConfig: ModelConfiguration
         if ModelStorage.isLocalDirectoryPath(modelId) {
             print("[SwiftLM] Loading from local directory: \(modelId)")
             modelConfig = ModelConfiguration(directory: URL(filePath: modelId))
-        } else if let dir = validatedLocal, !validatedLocalMissing.isEmpty {
-            print("[SwiftLM] \(dir.path) is missing \(validatedLocalMissing.count) file(s) (e.g. \(validatedLocalMissing[0])); loading through the Hub to complete it.")
-            modelConfig = ModelConfiguration(id: modelId)
-        } else if let localDirectory = validatedLocal {
+        } else if let localDirectory = ModelStorage.validatedContentDirectory(for: modelId) {
             // Any validated copy in the shared HF cache, in any supported layout. Note
             // this deliberately does NOT use localLoadDirectory: that skips the
             // materialized `models/<org>/<name>` layout on the grounds that HubApi
@@ -723,9 +705,11 @@ struct MLXServer: AsyncParsableCommand {
         var modelDirectory =
             ModelStorage.validatedContentDirectory(for: modelId)
             ?? resolveModelDirectory(modelId: modelId)
-        if self.streamExperts, !self.info, isHubId, let listing = hubListing {
+        if self.streamExperts, !self.info, isHubId {
+            // A Hub or download failure here is a model problem, not a binary one.
+            phase = .architectureProbe
             modelDirectory = try await resolveStreamingDirectory(
-                modelId: modelId, candidate: modelDirectory, hub: cliHub, listing: listing)
+                modelId: modelId, candidate: modelDirectory, hub: cliHub)
         }
         var mainModelProfile: ModelProfile? = nil
         if self.streamExperts, let dir = modelDirectory {
