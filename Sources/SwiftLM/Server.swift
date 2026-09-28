@@ -420,7 +420,9 @@ final class ProgressTracker {
 /// for a protocol-critical signal the daemon is meant to positively rely
 /// on (not just infer), a dropped emit with zero diagnostic trail would be
 /// hard to ever notice. Logs to stderr on failure instead.
-func emitEvent(_ payload: [String: Any]) {
+/// `preface` lines are written in the same `print` as the JSON, so no generation
+/// token can land between them and push the JSON off the start of its line.
+func emitEvent(_ payload: [String: Any], preface: String? = nil) {
     guard let data = try? JSONSerialization.data(withJSONObject: payload),
           let json = String(data: data, encoding: .utf8)
     else {
@@ -428,11 +430,13 @@ func emitEvent(_ payload: [String: Any]) {
             Data("[SwiftLM] failed to encode event for stdout: \(payload)\n".utf8))
         return
     }
+    var out = ""
     if ProgressTracker.barOpen {
-        print("")
+        out += "\n"
         ProgressTracker.barOpen = false
     }
-    print(json)
+    if let preface { out += preface + "\n" }
+    print(out + json)
     fflush(stdout)
 }
 
@@ -453,20 +457,32 @@ func exitAfterShutdownRequest() -> Never {
 
 /// A `--stream-experts` prefetch finished without every weight shard on disk,
 /// for example offline with a partial copy.
-struct ModelDownloadIncomplete: LocalizedError {
+struct ModelDownloadIncomplete: Error, CustomStringConvertible {
     let modelId: String
     let directory: URL
-    var errorDescription: String? {
+    var description: String {
         "Download of \(modelId) is incomplete (\(directory.path)). Check the network, or delete the directory and retry."
     }
 }
 
-/// Whether `directory` has the files `TransformersTokenizerLoader` reads.
-func hasTokenizerFiles(in directory: URL) -> Bool {
-    let fm = FileManager.default
-    return fm.fileExists(atPath: directory.appendingPathComponent("tokenizer_config.json").path)
-        && (fm.fileExists(atPath: directory.appendingPathComponent("tokenizer.json").path)
-            || fm.fileExists(atPath: directory.appendingPathComponent("vocab.json").path))
+/// The repository has no `tokenizer.json`, which the tokenizer loader requires.
+struct ModelMissingTokenizer: Error, CustomStringConvertible {
+    let modelId: String
+    var description: String {
+        "\(modelId) has no tokenizer.json, which SwiftLM needs to load it."
+    }
+}
+
+/// Whether `directory` has `tokenizer.json`. swift-transformers requires it;
+/// `tokenizer_config.json` is optional, and `vocab.json` is no substitute.
+func hasTokenizerJSON(in directory: URL) -> Bool {
+    FileManager.default.fileExists(atPath: directory.appendingPathComponent("tokenizer.json").path)
+}
+
+/// Whether a local copy can be streamed and loaded by directory: every shard, plus
+/// the tokenizer the loader won't fetch when it reads a directory.
+func isLoadableModelDirectory(_ directory: URL) -> Bool {
+    ModelStorage.validateLocalModelDirectory(directory) && hasTokenizerJSON(in: directory)
 }
 
 /// Where `run()` is when it throws, so `classifyExitReason` can produce a more
@@ -712,10 +728,9 @@ struct MLXServer: AsyncParsableCommand {
             ModelStorage.validatedContentDirectory(for: modelId)
             ?? resolveModelDirectory(modelId: modelId)
         // resolveModelDirectory doesn't check the weights are there; streaming must not be
-        // activated for an empty or partial snapshot the loader won't read.
-        if self.streamExperts, let dir = modelDirectory,
-            !ModelStorage.validateLocalModelDirectory(dir)
-        {
+        // activated for an empty or partial snapshot, or one without a tokenizer, since
+        // the streamed model loads from this exact directory and nothing fills it in.
+        if self.streamExperts, let dir = modelDirectory, !isLoadableModelDirectory(dir) {
             modelDirectory = nil
         }
         if self.streamExperts, !self.info, modelDirectory == nil,
@@ -732,8 +747,9 @@ struct MLXServer: AsyncParsableCommand {
             // enough: an interrupted download can still be missing tokenizer or template
             // files, and the loader won't fill them in when it reads a directory.
             let completeMarker = localRepo.appendingPathComponent(".swiftlm-snapshot-complete")
+            let patterns = ["*.safetensors", "*.json", "*.jinja"]
             if FileManager.default.fileExists(atPath: completeMarker.path),
-                ModelStorage.validateLocalModelDirectory(localRepo)
+                isLoadableModelDirectory(localRepo)
             {
                 modelDirectory = localRepo
             } else {
@@ -742,19 +758,37 @@ struct MLXServer: AsyncParsableCommand {
                 print("[SwiftLM] --stream-experts: downloading \(modelId) before loading...")
                 let prefetchTracker = ProgressTracker(modelId: modelId)
                 defer { prefetchTracker.finish() }
-                let snapshot = try await hub.snapshot(
-                    from: modelId, matching: ["*.safetensors", "*.json", "*.jinja"]
-                ) { progress in
-                    prefetchTracker.printProgress(progress)
+                do {
+                    let snapshot = try await hub.snapshot(from: modelId, matching: patterns) {
+                        progress in prefetchTracker.printProgress(progress)
+                    }
+                    prefetchTracker.finish()
+                    // Offline, snapshot returns the repo directory even when it is partial.
+                    guard ModelStorage.validateLocalModelDirectory(snapshot) else {
+                        throw ModelDownloadIncomplete(modelId: modelId, directory: snapshot)
+                    }
+                    guard hasTokenizerJSON(in: snapshot) else {
+                        throw ModelMissingTokenizer(modelId: modelId)
+                    }
+                    // Mark complete only against the online file list, so an offline
+                    // partial copy is healed by the next online start.
+                    if let names = try? await hub.getFilenames(from: modelId, matching: patterns),
+                        !names.isEmpty,
+                        names.allSatisfy({
+                            FileManager.default.fileExists(
+                                atPath: snapshot.appendingPathComponent($0).path)
+                        })
+                    {
+                        FileManager.default.createFile(atPath: completeMarker.path, contents: nil)
+                    }
+                    modelDirectory = snapshot
+                } catch where isLoadableModelDirectory(localRepo) {
+                    // Hub unreachable, but a loadable copy is already here (for example
+                    // one from before the marker existed): use it rather than fail.
+                    prefetchTracker.finish()
+                    print("[SwiftLM] ⚠️  Could not verify \(modelId) with the Hub (\(error)); using the local copy.")
+                    modelDirectory = localRepo
                 }
-                // Offline, snapshot returns the repo directory even when it is partial.
-                guard ModelStorage.validateLocalModelDirectory(snapshot),
-                    hasTokenizerFiles(in: snapshot)
-                else {
-                    throw ModelDownloadIncomplete(modelId: modelId, directory: snapshot)
-                }
-                FileManager.default.createFile(atPath: completeMarker.path, contents: nil)
-                modelDirectory = snapshot
             }
         }
         var mainModelProfile: ModelProfile? = nil
@@ -776,8 +810,7 @@ struct MLXServer: AsyncParsableCommand {
 
         // Streaming is activated for `modelDirectory`, and only a load of that exact
         // directory streams. Load from it, or a different lookup could pick another copy.
-        // Keep the id when tokenizer files are missing, so the loader can fetch them.
-        if self.streamExperts, let dir = modelDirectory, hasTokenizerFiles(in: dir) {
+        if self.streamExperts, let dir = modelDirectory {
             modelConfig = ModelConfiguration(directory: dir)
         }
 
@@ -1654,13 +1687,15 @@ struct MLXServer: AsyncParsableCommand {
         signal(SIGPIPE, SIG_IGN)
 
         shutdownSource.setEventHandler {
-            print("\n[SwiftLM] Received SIGTERM, shutting down gracefully...")
-            emitEvent(["event": "exiting", "reason": "requested"])
+            emitEvent(
+                ["event": "exiting", "reason": "requested"],
+                preface: "\n[SwiftLM] Received SIGTERM, shutting down gracefully...")
             exitAfterShutdownRequest()
         }
         interruptSource.setEventHandler {
-            print("\n[SwiftLM] Received SIGINT, shutting down gracefully...")
-            emitEvent(["event": "exiting", "reason": "requested"])
+            emitEvent(
+                ["event": "exiting", "reason": "requested"],
+                preface: "\n[SwiftLM] Received SIGINT, shutting down gracefully...")
             exitAfterShutdownRequest()
         }
         shutdownSource.resume()
