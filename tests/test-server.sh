@@ -39,6 +39,10 @@ cleanup() {
         kill -9 "$TERM_SERVER_PID" 2>/dev/null || true
         wait "$TERM_SERVER_PID" 2>/dev/null || true
     fi
+    if [ -n "${TERM_CURL_PID:-}" ]; then
+        kill "$TERM_CURL_PID" 2>/dev/null || true
+    fi
+    rm -f "${TERM_LOG:-}" "${TERM_STREAM:-}"
     if [ -n "${CORS_SERVER_PID:-}" ]; then
         log "Stopping CORS server (PID $CORS_SERVER_PID)"
         kill -9 "$CORS_SERVER_PID" 2>/dev/null || true
@@ -1229,7 +1233,8 @@ done
 
 if [ "$TERM_READY" != true ]; then
     fail "SIGTERM mid-stream: server did not become ready"
-    tail -5 "$TERM_LOG" || true
+    tail -40 "$TERM_LOG" || true
+    cp "$TERM_LOG" /tmp/SwiftLM-test-sigterm.log 2>/dev/null || true
     kill -9 "$TERM_SERVER_PID" 2>/dev/null || true
     wait "$TERM_SERVER_PID" 2>/dev/null || true
     unset TERM_SERVER_PID
@@ -1260,20 +1265,26 @@ else
     unset TERM_SERVER_PID
     kill "$TERM_CURL_PID" 2>/dev/null || true
     wait "$TERM_CURL_PID" 2>/dev/null || true
+    unset TERM_CURL_PID
 
-    TERM_REASON=$({ grep '^{' "$TERM_LOG" || true; } \
-        | jq -r 'select(.event == "exiting") | .reason' 2>/dev/null | tail -1 || true)
+    # Each line on its own: a line that is not exactly one JSON object (an echoed
+    # token, or the event with a token glued on) must not count.
+    TERM_REASON=$(jq -rR 'fromjson? | select(type == "object" and .event == "exiting") | .reason' \
+        "$TERM_LOG" 2>/dev/null | tail -1 || true)
     if [ "$TERM_HUNG" = true ]; then
         fail "SIGTERM mid-stream: server still running 30s after SIGTERM"
-        tail -5 "$TERM_LOG" || true
+        tail -40 "$TERM_LOG" || true
+        cp "$TERM_LOG" /tmp/SwiftLM-test-sigterm.log 2>/dev/null || true
     elif [ "$TERM_STATUS" -eq 0 ] && [ "$TERM_REASON" = "requested" ]; then
         pass "SIGTERM mid-stream: exit 0, exiting{requested} on its own line"
     else
         fail "SIGTERM mid-stream: status=$TERM_STATUS reason='${TERM_REASON}'"
-        tail -5 "$TERM_LOG" || true
+        tail -40 "$TERM_LOG" || true
+        cp "$TERM_LOG" /tmp/SwiftLM-test-sigterm.log 2>/dev/null || true
     fi
 fi
 rm -f "$TERM_LOG" "$TERM_STREAM"
+unset TERM_LOG TERM_STREAM
 
 # ── Results ──────────────────────────────────────────────────────────
 echo ""

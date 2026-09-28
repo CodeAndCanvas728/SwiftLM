@@ -455,36 +455,6 @@ func exitAfterShutdownRequest() -> Never {
     Darwin._exit(0)
 }
 
-/// A `--stream-experts` prefetch finished without every weight shard on disk,
-/// for example offline with a partial copy.
-struct ModelDownloadIncomplete: Error, CustomStringConvertible {
-    let modelId: String
-    let directory: URL
-    var description: String {
-        "Download of \(modelId) is incomplete (\(directory.path)). Check the network, or delete the directory and retry."
-    }
-}
-
-/// The repository has no `tokenizer.json`, which the tokenizer loader requires.
-struct ModelMissingTokenizer: Error, CustomStringConvertible {
-    let modelId: String
-    var description: String {
-        "\(modelId) has no tokenizer.json, which SwiftLM needs to load it."
-    }
-}
-
-/// Whether `directory` has `tokenizer.json`. swift-transformers requires it;
-/// `tokenizer_config.json` is optional, and `vocab.json` is no substitute.
-func hasTokenizerJSON(in directory: URL) -> Bool {
-    FileManager.default.fileExists(atPath: directory.appendingPathComponent("tokenizer.json").path)
-}
-
-/// Whether a local copy can be streamed and loaded by directory: every shard, plus
-/// the tokenizer the loader won't fetch when it reads a directory.
-func isLoadableModelDirectory(_ directory: URL) -> Bool {
-    ModelStorage.validateLocalModelDirectory(directory) && hasTokenizerJSON(in: directory)
-}
-
 /// Where `run()` is when it throws, so `classifyExitReason` can produce a more
 /// precise `reason` than "something failed" and `detail` can name which load
 /// stalled. Set immediately before each fallible stage begins; read only if
@@ -697,11 +667,37 @@ struct MLXServer: AsyncParsableCommand {
         let modelId = model
 
         // ── Load model ──
+        // Same root the loader's HubApi uses further down.
+        let cliHub = HubApi(
+            downloadBase: URL.applicationSupportDirectory
+                .appendingPathComponent("MLX", isDirectory: true)
+                .appendingPathComponent("HuggingFace", isDirectory: true))
+        let isHubId = !ModelStorage.isLocalDirectoryPath(modelId)
+            && !FileManager.default.fileExists(atPath: modelId)
+        let validatedLocal = isHubId ? ModelStorage.validatedContentDirectory(for: modelId) : nil
+        // A copy whose download stopped after the shards still validates, so check local
+        // copies against the Hub's file list. --stream-experts needs the list anyway, and
+        // a Hub error there (unknown or gated id) fails the start.
+        var hubListing: HubListing? = nil
+        if isHubId, !self.info, self.streamExperts || validatedLocal != nil {
+            phase = .architectureProbe
+            hubListing = self.streamExperts
+                ? try await fetchHubListing(cliHub, modelId: modelId)
+                : try? await fetchHubListing(cliHub, modelId: modelId)
+        }
+        var validatedLocalMissing: [String] = []
+        if let dir = validatedLocal, case .files(let files)? = hubListing {
+            validatedLocalMissing = missingFiles(files, in: dir)
+        }
+
         var modelConfig: ModelConfiguration
         if ModelStorage.isLocalDirectoryPath(modelId) {
             print("[SwiftLM] Loading from local directory: \(modelId)")
             modelConfig = ModelConfiguration(directory: URL(filePath: modelId))
-        } else if let localDirectory = ModelStorage.validatedContentDirectory(for: modelId) {
+        } else if let dir = validatedLocal, !validatedLocalMissing.isEmpty {
+            print("[SwiftLM] \(dir.path) is missing \(validatedLocalMissing.count) file(s) (e.g. \(validatedLocalMissing[0])); loading through the Hub to complete it.")
+            modelConfig = ModelConfiguration(id: modelId)
+        } else if let localDirectory = validatedLocal {
             // Any validated copy in the shared HF cache, in any supported layout. Note
             // this deliberately does NOT use localLoadDirectory: that skips the
             // materialized `models/<org>/<name>` layout on the grounds that HubApi
@@ -727,69 +723,9 @@ struct MLXServer: AsyncParsableCommand {
         var modelDirectory =
             ModelStorage.validatedContentDirectory(for: modelId)
             ?? resolveModelDirectory(modelId: modelId)
-        // resolveModelDirectory doesn't check the weights are there; streaming must not be
-        // activated for an empty or partial snapshot, or one without a tokenizer, since
-        // the streamed model loads from this exact directory and nothing fills it in.
-        if self.streamExperts, let dir = modelDirectory, !isLoadableModelDirectory(dir) {
-            modelDirectory = nil
-        }
-        if self.streamExperts, !self.info, modelDirectory == nil,
-            !FileManager.default.fileExists(atPath: modelId)
-        {
-            // Streaming must be activated for the directory the loader reads, so resolve it
-            // before loading. Same hub root as the loader below, which reuses these files.
-            let hub = HubApi(
-                downloadBase: URL.applicationSupportDirectory
-                    .appendingPathComponent("MLX", isDirectory: true)
-                    .appendingPathComponent("HuggingFace", isDirectory: true))
-            let localRepo = hub.localRepoLocation(Hub.Repo(id: modelId))
-            // Reuse only a copy a finished snapshot left behind. Shards alone are not
-            // enough: an interrupted download can still be missing tokenizer or template
-            // files, and the loader won't fill them in when it reads a directory.
-            let completeMarker = localRepo.appendingPathComponent(".swiftlm-snapshot-complete")
-            let patterns = ["*.safetensors", "*.json", "*.jinja"]
-            if FileManager.default.fileExists(atPath: completeMarker.path),
-                isLoadableModelDirectory(localRepo)
-            {
-                modelDirectory = localRepo
-            } else {
-                // First run. A failed download is a model problem, not a binary one.
-                phase = .architectureProbe
-                print("[SwiftLM] --stream-experts: downloading \(modelId) before loading...")
-                let prefetchTracker = ProgressTracker(modelId: modelId)
-                defer { prefetchTracker.finish() }
-                do {
-                    let snapshot = try await hub.snapshot(from: modelId, matching: patterns) {
-                        progress in prefetchTracker.printProgress(progress)
-                    }
-                    prefetchTracker.finish()
-                    // Offline, snapshot returns the repo directory even when it is partial.
-                    guard ModelStorage.validateLocalModelDirectory(snapshot) else {
-                        throw ModelDownloadIncomplete(modelId: modelId, directory: snapshot)
-                    }
-                    guard hasTokenizerJSON(in: snapshot) else {
-                        throw ModelMissingTokenizer(modelId: modelId)
-                    }
-                    // Mark complete only against the online file list, so an offline
-                    // partial copy is healed by the next online start.
-                    if let names = try? await hub.getFilenames(from: modelId, matching: patterns),
-                        !names.isEmpty,
-                        names.allSatisfy({
-                            FileManager.default.fileExists(
-                                atPath: snapshot.appendingPathComponent($0).path)
-                        })
-                    {
-                        FileManager.default.createFile(atPath: completeMarker.path, contents: nil)
-                    }
-                    modelDirectory = snapshot
-                } catch where isLoadableModelDirectory(localRepo) {
-                    // Hub unreachable, but a loadable copy is already here (for example
-                    // one from before the marker existed): use it rather than fail.
-                    prefetchTracker.finish()
-                    print("[SwiftLM] ⚠️  Could not verify \(modelId) with the Hub (\(error)); using the local copy.")
-                    modelDirectory = localRepo
-                }
-            }
+        if self.streamExperts, !self.info, isHubId, let listing = hubListing {
+            modelDirectory = try await resolveStreamingDirectory(
+                modelId: modelId, candidate: modelDirectory, hub: cliHub, listing: listing)
         }
         var mainModelProfile: ModelProfile? = nil
         if self.streamExperts, let dir = modelDirectory {

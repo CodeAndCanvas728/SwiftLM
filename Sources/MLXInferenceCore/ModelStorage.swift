@@ -280,6 +280,11 @@ public enum ModelStorage {
         validateModelFiles(in: directory, logFailures: true)
     }
 
+    /// `validateLocalModelDirectory` without logging, for probing candidate copies.
+    public static func validateLocalModelDirectory(_ directory: URL, logFailures: Bool) -> Bool {
+        validateModelFiles(in: directory, logFailures: logFailures)
+    }
+
     /// Read the raw config.json dictionary for a downloaded model.
     /// Verifies that all required safetensors files are present in the snapshot directory.
     /// This prevents the engine from entering `.ready` state if a download was interrupted or corrupted.
