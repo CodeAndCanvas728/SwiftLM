@@ -705,11 +705,14 @@ struct MLXServer: AsyncParsableCommand {
         var modelDirectory =
             ModelStorage.validatedContentDirectory(for: modelId)
             ?? resolveModelDirectory(modelId: modelId)
+        var modelDirectoryComplete = false
         if self.streamExperts, !self.info, isHubId {
             // A Hub or download failure here is a model problem, not a binary one.
             phase = .architectureProbe
-            modelDirectory = try await resolveStreamingDirectory(
+            let resolved = try await resolveStreamingDirectory(
                 modelId: modelId, candidate: modelDirectory, hub: cliHub)
+            modelDirectory = resolved.directory
+            modelDirectoryComplete = resolved.complete
         }
         var mainModelProfile: ModelProfile? = nil
         if self.streamExperts, let dir = modelDirectory {
@@ -730,7 +733,8 @@ struct MLXServer: AsyncParsableCommand {
 
         // Streaming is activated for `modelDirectory`, and only a load of that exact
         // directory streams. Load from it, or a different lookup could pick another copy.
-        if self.streamExperts, let dir = modelDirectory {
+        // A complete copy also loads from here after the MoE check turns streaming off.
+        if let dir = modelDirectory, self.streamExperts || modelDirectoryComplete {
             modelConfig = ModelConfiguration(directory: dir)
         }
 
