@@ -35,6 +35,14 @@ cleanup() {
         kill -9 "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
+    if [ -n "${TERM_SERVER_PID:-}" ]; then
+        kill -9 "$TERM_SERVER_PID" 2>/dev/null || true
+        wait "$TERM_SERVER_PID" 2>/dev/null || true
+    fi
+    if [ -n "${TERM_CURL_PID:-}" ]; then
+        kill "$TERM_CURL_PID" 2>/dev/null || true
+    fi
+    rm -f "${TERM_LOG:-}" "${TERM_STREAM:-}"
     if [ -n "${CORS_SERVER_PID:-}" ]; then
         log "Stopping CORS server (PID $CORS_SERVER_PID)"
         kill -9 "$CORS_SERVER_PID" 2>/dev/null || true
@@ -1202,6 +1210,81 @@ else
 fi
 rm -f /tmp/mlx_ttfb_prompt.txt /tmp/mlx_ttfb_body.json /tmp/mlx_ttfb_stream.txt
 
+
+# ── Test 39: SIGTERM during generation exits cleanly ─────────────────
+# A shutdown request mid-stream must exit 0 with exiting{reason:"requested"} on its
+# own line (exit() used to race an in-flight GPU eval and crash, #197). A crash
+# shows up as a nonzero status; crash reports are written too late to check here.
+log "Test 39: SIGTERM during a streaming generation"
+TERM_PORT=$((PORT + 3))
+TERM_LOG=$(mktemp)
+TERM_STREAM=$(mktemp)
+"$BINARY" --model "$MODEL" --port "$TERM_PORT" --host "$HOST" > "$TERM_LOG" 2>&1 &
+TERM_SERVER_PID=$!
+TERM_READY=false
+for i in $(seq 1 120); do
+    if curl -sf "http://${HOST}:${TERM_PORT}/health" >/dev/null 2>&1; then
+        TERM_READY=true
+        break
+    fi
+    kill -0 "$TERM_SERVER_PID" 2>/dev/null || break
+    sleep 1
+done
+
+if [ "$TERM_READY" != true ]; then
+    fail "SIGTERM mid-stream: server did not become ready"
+    tail -40 "$TERM_LOG" || true
+    cp "$TERM_LOG" /tmp/SwiftLM-test-sigterm.log 2>/dev/null || true
+    kill -9 "$TERM_SERVER_PID" 2>/dev/null || true
+    wait "$TERM_SERVER_PID" 2>/dev/null || true
+    unset TERM_SERVER_PID
+else
+    curl -sN -X POST "http://${HOST}:${TERM_PORT}/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\":\"$MODEL\",\"stream\":true,\"max_tokens\":2048,\"messages\":[{\"role\":\"user\",\"content\":\"Write a very long story about a lighthouse keeper.\"}]}" \
+        > "$TERM_STREAM" 2>/dev/null &
+    TERM_CURL_PID=$!
+    for i in $(seq 1 200); do
+        grep -q '"content"' "$TERM_STREAM" 2>/dev/null && break
+        sleep 0.1
+    done
+    kill -TERM "$TERM_SERVER_PID" 2>/dev/null || true
+
+    # Bounded wait: a shutdown hang must fail here, not at the job timeout.
+    TERM_HUNG=false
+    for i in $(seq 1 300); do
+        kill -0 "$TERM_SERVER_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$TERM_SERVER_PID" 2>/dev/null; then
+        TERM_HUNG=true
+        kill -9 "$TERM_SERVER_PID" 2>/dev/null || true
+    fi
+    TERM_STATUS=0
+    wait "$TERM_SERVER_PID" 2>/dev/null || TERM_STATUS=$?
+    unset TERM_SERVER_PID
+    kill "$TERM_CURL_PID" 2>/dev/null || true
+    wait "$TERM_CURL_PID" 2>/dev/null || true
+    unset TERM_CURL_PID
+
+    # Each line on its own: a line that is not exactly one JSON object (an echoed
+    # token, or the event with a token glued on) must not count.
+    TERM_REASON=$(jq -rR 'fromjson? | select(type == "object" and .event == "exiting") | .reason' \
+        "$TERM_LOG" 2>/dev/null | tail -1 || true)
+    if [ "$TERM_HUNG" = true ]; then
+        fail "SIGTERM mid-stream: server still running 30s after SIGTERM"
+        tail -40 "$TERM_LOG" || true
+        cp "$TERM_LOG" /tmp/SwiftLM-test-sigterm.log 2>/dev/null || true
+    elif [ "$TERM_STATUS" -eq 0 ] && [ "$TERM_REASON" = "requested" ]; then
+        pass "SIGTERM mid-stream: exit 0, exiting{requested} on its own line"
+    else
+        fail "SIGTERM mid-stream: status=$TERM_STATUS reason='${TERM_REASON}'"
+        tail -40 "$TERM_LOG" || true
+        cp "$TERM_LOG" /tmp/SwiftLM-test-sigterm.log 2>/dev/null || true
+    fi
+fi
+rm -f "$TERM_LOG" "$TERM_STREAM"
+unset TERM_LOG TERM_STREAM
 
 # ── Results ──────────────────────────────────────────────────────────
 echo ""

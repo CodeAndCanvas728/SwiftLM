@@ -277,6 +277,7 @@ final class ProgressTracker {
     private var lastUpdate: TimeInterval = 0
     private var lastBytes: Int64 = 0
     private var speedStr = "0.0 MB/s"
+    private var progress: Progress?
     
     init(modelId: String) {
         self.modelId = modelId
@@ -291,6 +292,11 @@ final class ProgressTracker {
         isDone = true
         trackingTask?.cancel()
         if Self.barOpen {
+            // The Task may be cancelled before its last frame; show where it ended.
+            if let progress {
+                print(frame(fraction: progress.fractionCompleted).padding(
+                    toLength: 100, withPad: " ", startingAt: 0), terminator: "")
+            }
             print("")
             fflush(stdout)
             Self.barOpen = false
@@ -320,7 +326,37 @@ final class ProgressTracker {
         return sumDir(modelHubDir) + sumDir(downloadDir)
     }
     
+    /// One `\r` frame of the download bar at `fraction`.
+    private func frame(fraction: Double) -> String {
+        let pct = Int(fraction * 100)
+        var completedMB = String(format: "%.1f", Double(self.lastBytes) / 1_048_576)
+        var totalMB = "???"
+        if fraction > 0.001 {
+            let extrapolated = (Double(self.lastBytes) / fraction) / 1_048_576.0
+            totalMB = String(format: "%.1f", extrapolated)
+        } else if fraction == 0.0 {
+             completedMB = "0.0"
+        }
+        
+        let barLength = 20
+        let completedBars = min(barLength, Int(fraction * Double(barLength)))
+        let emptyBars = max(0, barLength - completedBars)
+        
+        var bars = ""
+        if completedBars > 0 {
+            bars += String(repeating: "=", count: completedBars - 1) + ">"
+        }
+        bars += String(repeating: " ", count: emptyBars)
+        
+        let pctStr = String(format: "%3d%%", pct)
+        let spinner = self.spinnerFrames[self.frameIndex]
+        let speedText = "| Speed: \(self.speedStr)"
+        
+        return String(format: "\r[SwiftLM] Download: [%@] %@ %@ (%@ MB / %@ MB) %@", bars, pctStr, spinner, completedMB, totalMB, speedText)
+    }
+
     func printProgress(_ progress: Progress) {
+        self.progress = progress
         if trackingTask == nil {
             lastUpdate = Date().timeIntervalSince1970
             lastBytes = getDownloadedBytes()
@@ -329,7 +365,6 @@ final class ProgressTracker {
                 while !self.isDone && !Task.isCancelled {
                     let now = Date().timeIntervalSince1970
                     let fraction = progress.fractionCompleted
-                    let pct = Int(fraction * 100)
                     
                     let interval = now - self.lastUpdate
                     if interval >= 0.25 {
@@ -348,30 +383,7 @@ final class ProgressTracker {
                         self.lastUpdate = now
                     }
                     
-                    var completedMB = String(format: "%.1f", Double(self.lastBytes) / 1_048_576)
-                    var totalMB = "???"
-                    if fraction > 0.001 {
-                        let extrapolated = (Double(self.lastBytes) / fraction) / 1_048_576.0
-                        totalMB = String(format: "%.1f", extrapolated)
-                    } else if fraction == 0.0 {
-                         completedMB = "0.0"
-                    }
-                    
-                    let barLength = 20
-                    let completedBars = min(barLength, Int(fraction * Double(barLength)))
-                    let emptyBars = max(0, barLength - completedBars)
-                    
-                    var bars = ""
-                    if completedBars > 0 {
-                        bars += String(repeating: "=", count: completedBars - 1) + ">"
-                    }
-                    bars += String(repeating: " ", count: emptyBars)
-                    
-                    let pctStr = String(format: "%3d%%", pct)
-                    let spinner = self.spinnerFrames[self.frameIndex]
-                    let speedText = "| Speed: \(self.speedStr)"
-                    
-                    let msg = String(format: "\r[SwiftLM] Download: [%@] %@ %@ (%@ MB / %@ MB) %@", bars, pctStr, spinner, completedMB, totalMB, speedText)
+                    let msg = self.frame(fraction: fraction)
                     
                     if self.isDone { break }
                     print(msg.padding(toLength: 100, withPad: " ", startingAt: 0), terminator: "")
@@ -408,6 +420,26 @@ final class ProgressTracker {
 /// for a protocol-critical signal the daemon is meant to positively rely
 /// on (not just infer), a dropped emit with zero diagnostic trail would be
 /// hard to ever notice. Logs to stderr on failure instead.
+/// `preface` lines are written in the same `print` as the JSON, so no generation
+/// token can land between them and push the JSON off the start of its line.
+func emitEvent(_ payload: [String: Any], preface: String? = nil) {
+    guard let data = try? JSONSerialization.data(withJSONObject: payload),
+          let json = String(data: data, encoding: .utf8)
+    else {
+        FileHandle.standardError.write(
+            Data("[SwiftLM] failed to encode event for stdout: \(payload)\n".utf8))
+        return
+    }
+    var out = ""
+    if ProgressTracker.barOpen {
+        out += "\n"
+        ProgressTracker.barOpen = false
+    }
+    if let preface { out += preface + "\n" }
+    print(out + json)
+    fflush(stdout)
+}
+
 /// Ends the process after a requested shutdown (SIGTERM/SIGINT) without running
 /// C++ static destructors or `atexit` handlers.
 ///
@@ -421,22 +453,6 @@ func exitAfterShutdownRequest() -> Never {
     fflush(stdout)
     fflush(stderr)
     Darwin._exit(0)
-}
-
-func emitEvent(_ payload: [String: Any]) {
-    guard let data = try? JSONSerialization.data(withJSONObject: payload),
-          let json = String(data: data, encoding: .utf8)
-    else {
-        FileHandle.standardError.write(
-            Data("[SwiftLM] failed to encode event for stdout: \(payload)\n".utf8))
-        return
-    }
-    if ProgressTracker.barOpen {
-        print("")
-        ProgressTracker.barOpen = false
-    }
-    print(json)
-    fflush(stdout)
 }
 
 /// Where `run()` is when it throws, so `classifyExitReason` can produce a more
@@ -651,6 +667,14 @@ struct MLXServer: AsyncParsableCommand {
         let modelId = model
 
         // ── Load model ──
+        // Same root the loader's HubApi uses further down.
+        let cliHub = HubApi(
+            downloadBase: URL.applicationSupportDirectory
+                .appendingPathComponent("MLX", isDirectory: true)
+                .appendingPathComponent("HuggingFace", isDirectory: true))
+        let isHubId = !ModelStorage.isLocalDirectoryPath(modelId)
+            && !FileManager.default.fileExists(atPath: modelId)
+
         var modelConfig: ModelConfiguration
         if ModelStorage.isLocalDirectoryPath(modelId) {
             print("[SwiftLM] Loading from local directory: \(modelId)")
@@ -681,46 +705,20 @@ struct MLXServer: AsyncParsableCommand {
         var modelDirectory =
             ModelStorage.validatedContentDirectory(for: modelId)
             ?? resolveModelDirectory(modelId: modelId)
-        // resolveModelDirectory doesn't check the weights are there; streaming must not be
-        // activated for an empty or partial snapshot the loader won't read.
-        if self.streamExperts, let dir = modelDirectory,
-            !ModelStorage.validateLocalModelDirectory(dir)
+        var modelDirectoryComplete = false
+        // --info doesn't download; don't profile a copy that is clearly partial.
+        if self.streamExperts, self.info, isHubId, let dir = modelDirectory,
+            localWeightState(in: dir) == .incomplete
         {
             modelDirectory = nil
         }
-        if self.streamExperts, !self.info, modelDirectory == nil,
-            !FileManager.default.fileExists(atPath: modelId)
-        {
-            // Streaming must be activated for the directory the loader reads, so resolve it
-            // before loading. Same hub root as the loader below, which reuses these files.
-            let hub = HubApi(
-                downloadBase: URL.applicationSupportDirectory
-                    .appendingPathComponent("MLX", isDirectory: true)
-                    .appendingPathComponent("HuggingFace", isDirectory: true))
-            let localRepo = hub.localRepoLocation(Hub.Repo(id: modelId))
-            // Every shard must be present: an interrupted download (or the config.json
-            // the architecture probe fetches) would otherwise plan with a partial size.
-            if FileManager.default.fileExists(atPath: localRepo.path),
-                ModelStorage.validateLocalModelDirectory(localRepo)
-            {
-                modelDirectory = localRepo
-            } else {
-                // First run. A failed download is a model problem, not a binary one.
-                phase = .architectureProbe
-                print("[SwiftLM] --stream-experts: downloading \(modelId) before loading...")
-                let prefetchTracker = ProgressTracker(modelId: modelId)
-                defer { prefetchTracker.finish() }
-                modelDirectory = try await hub.snapshot(
-                    from: modelId, matching: ["*.safetensors", "*.json", "*.jinja"]
-                ) { progress in
-                    prefetchTracker.printProgress(progress)
-                }
-            }
-        }
-        // Streaming is activated for `modelDirectory`, and only a load of that exact
-        // directory streams. Load from it, or a different lookup could pick another copy.
-        if self.streamExperts, let dir = modelDirectory {
-            modelConfig = ModelConfiguration(directory: dir)
+        if self.streamExperts, !self.info, isHubId {
+            // A Hub or download failure here is a model problem, not a binary one.
+            phase = .architectureProbe
+            let resolved = try await resolveStreamingDirectory(
+                modelId: modelId, candidate: modelDirectory, hub: cliHub)
+            modelDirectory = resolved.directory
+            modelDirectoryComplete = resolved.complete
         }
         var mainModelProfile: ModelProfile? = nil
         if self.streamExperts, let dir = modelDirectory {
@@ -737,6 +735,13 @@ struct MLXServer: AsyncParsableCommand {
                 print("[SwiftLM]    If this model *is* MoE, please report it — see issue #112.")
                 self.streamExperts = false
             }
+        }
+
+        // Streaming is activated for `modelDirectory`, and only a load of that exact
+        // directory streams. Load from it, or a different lookup could pick another copy.
+        // A complete copy also loads from here after the MoE check turns streaming off.
+        if let dir = modelDirectory, self.streamExperts || modelDirectoryComplete {
+            modelConfig = ModelConfiguration(directory: dir)
         }
 
         // Inject streaming flag into config to bypass eval(model) if requested
@@ -1605,20 +1610,22 @@ struct MLXServer: AsyncParsableCommand {
         // is already gone by the time a shutdown signal arrives (e.g. the
         // daemon itself already crashed), the exiting-event print()/fflush
         // below can raise SIGPIPE — whose default disposition kills this
-        // process via signal instead of reaching Darwin.exit(0), producing
+        // process via signal instead of reaching exitAfterShutdownRequest(), producing
         // exactly the ambiguous "was this a crash?" signature this feature
         // exists to eliminate. Ignore SIGPIPE so a closed pipe surfaces as
         // an ordinary EPIPE write error instead.
         signal(SIGPIPE, SIG_IGN)
 
         shutdownSource.setEventHandler {
-            print("\n[SwiftLM] Received SIGTERM, shutting down gracefully...")
-            emitEvent(["event": "exiting", "reason": "requested"])
+            emitEvent(
+                ["event": "exiting", "reason": "requested"],
+                preface: "\n[SwiftLM] Received SIGTERM, shutting down gracefully...")
             exitAfterShutdownRequest()
         }
         interruptSource.setEventHandler {
-            print("\n[SwiftLM] Received SIGINT, shutting down gracefully...")
-            emitEvent(["event": "exiting", "reason": "requested"])
+            emitEvent(
+                ["event": "exiting", "reason": "requested"],
+                preface: "\n[SwiftLM] Received SIGINT, shutting down gracefully...")
             exitAfterShutdownRequest()
         }
         shutdownSource.resume()
