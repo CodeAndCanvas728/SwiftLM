@@ -706,6 +706,12 @@ struct MLXServer: AsyncParsableCommand {
             ModelStorage.validatedContentDirectory(for: modelId)
             ?? resolveModelDirectory(modelId: modelId)
         var modelDirectoryComplete = false
+        // --info doesn't download; don't profile a copy that is clearly partial.
+        if self.streamExperts, self.info, isHubId, let dir = modelDirectory,
+            localWeightState(in: dir) == .incomplete
+        {
+            modelDirectory = nil
+        }
         if self.streamExperts, !self.info, isHubId {
             // A Hub or download failure here is a model problem, not a binary one.
             phase = .architectureProbe

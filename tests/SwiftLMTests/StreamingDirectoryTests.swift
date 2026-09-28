@@ -61,6 +61,41 @@ final class StreamingDirectoryTests: XCTestCase {
         XCTAssertEqual(localWeightState(in: dir), .incomplete)
     }
 
+    /// OptiQ VLMs index their vision tower in optiq/; a download of only model*.safetensors
+    /// has every top-level shard but not that file.
+    private func indexWithNestedVision() throws {
+        var map = Dictionary(uniqueKeysWithValues: (1 ... 2).map {
+            ("layer\($0).weight", String(format: "model-%05d-of-%05d.safetensors", $0, 2))
+        })
+        map["vision_tower.weight"] = "optiq/optiq_vision.safetensors"
+        let json = try JSONSerialization.data(withJSONObject: ["weight_map": map])
+        try json.write(to: dir.appendingPathComponent("model.safetensors.index.json"))
+    }
+
+    func testIndexedFileMissingFromSubdirectoryIsIncomplete() throws {
+        try indexWithNestedVision()
+        try shards([1, 2], of: 2)
+        XCTAssertEqual(localWeightState(in: dir), .incomplete)
+    }
+
+    func testIndexedSubdirectoryFilePresentIsComplete() throws {
+        try indexWithNestedVision()
+        try shards([1, 2], of: 2)
+        try FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("optiq"), withIntermediateDirectories: true)
+        try write("optiq/optiq_vision.safetensors", "weights")
+        XCTAssertEqual(localWeightState(in: dir), .complete)
+    }
+
+    func testRequiredListedFilesIncludeIndexedNestedFiles() throws {
+        try indexWithNestedVision()
+        let listed = ["config.json", "model-00001-of-00002.safetensors",
+                      "optiq/optiq_vision.safetensors", "optiq/mtp.safetensors"]
+        XCTAssertEqual(
+            Set(requiredListedFiles(listed, in: dir)),
+            ["config.json", "model-00001-of-00002.safetensors", "optiq/optiq_vision.safetensors"])
+    }
+
     func testSingleModelFileIsComplete() throws {
         try write("model.safetensors", "weights")
         XCTAssertEqual(localWeightState(in: dir), .complete)

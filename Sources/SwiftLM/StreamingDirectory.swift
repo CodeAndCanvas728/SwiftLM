@@ -85,14 +85,13 @@ func shardNumber(_ name: String) -> (stem: String, index: Int, count: Int)? {
 /// `safetensorWeightURLs`: the index when every file it names exists, otherwise
 /// `model*`, then `weight*`, then every top-level `*.safetensors`.
 func localWeightState(in directory: URL) -> LocalWeights {
-    let index = directory.appendingPathComponent("model.safetensors.index.json")
-    if let data = try? Data(contentsOf: index),
-        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-        let weightMap = json["weight_map"] as? [String: String],
-        !weightMap.isEmpty,
-        Set(weightMap.values).allSatisfy({ isPresentFile($0, in: directory) })
-    {
-        return .complete
+    let indexed = indexedWeightFiles(in: directory)
+    if !indexed.isEmpty {
+        let missing = indexed.filter { !isPresentFile($0, in: directory) }
+        if missing.isEmpty { return .complete }
+        // A stale index names top-level shards the repo doesn't ship; a missing file
+        // in a subdirectory (optiq/optiq_vision.safetensors) is really missing.
+        if missing.contains(where: { $0.contains("/") }) { return .incomplete }
     }
     let top = ((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [])
         .filter { $0.hasSuffix(".safetensors") }
@@ -118,6 +117,23 @@ func localWeightState(in directory: URL) -> LocalWeights {
         return isPresentFile("model.safetensors", in: directory) ? .complete : .incomplete
     }
     return .unverified
+}
+
+/// The files `model.safetensors.index.json` in `directory` names, if any.
+func indexedWeightFiles(in directory: URL) -> Set<String> {
+    let index = directory.appendingPathComponent("model.safetensors.index.json")
+    guard let data = try? Data(contentsOf: index),
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let weightMap = json["weight_map"] as? [String: String]
+    else { return [] }
+    return Set(weightMap.values)
+}
+
+/// Listed files `directory` must have: every top-level one, plus any nested one its
+/// index names (weights in a subdirectory, such as OptiQ's vision tower).
+func requiredListedFiles(_ files: [String], in directory: URL) -> [String] {
+    let indexed = indexedWeightFiles(in: directory)
+    return files.filter { !$0.contains("/") || indexed.contains($0) }
 }
 
 /// Whether `directory` has the non-weight files the loader reads. swift-transformers
@@ -173,8 +189,9 @@ func resolveStreamingDirectory(
         throw ModelUnavailableOffline(modelId: modelId, underlying: error)
     }
     guard files.contains("tokenizer.json") else { throw ModelMissingTokenizer(modelId: modelId) }
-    let topLevel = files.filter { !$0.contains("/") }
-    if let dir = usable.first(where: { dir in topLevel.allSatisfy { isPresentFile($0, in: dir) } }) {
+    if let dir = usable.first(where: { dir in
+        requiredListedFiles(files, in: dir).allSatisfy { isPresentFile($0, in: dir) }
+    }) {
         return (dir, true)
     }
 
@@ -201,7 +218,7 @@ func resolveStreamingDirectory(
         tracker.printProgress($0)
     }
     tracker.finish()
-    guard topLevel.allSatisfy({ isPresentFile($0, in: snapshot) }),
+    guard requiredListedFiles(files, in: snapshot).allSatisfy({ isPresentFile($0, in: snapshot) }),
         hasModelConfigAndTokenizer(in: snapshot)
     else {
         throw ModelDownloadIncomplete(modelId: modelId, directory: snapshot)
