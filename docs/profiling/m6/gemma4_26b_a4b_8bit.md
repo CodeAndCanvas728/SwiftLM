@@ -1,4 +1,17 @@
-### `mlx-community/gemma-4-26b-a4b-it-8bit`
+### `mlx-community/gemma-4-26b-a4b-it-8bit` — release b782
+
+Apple M6 · 32 GB · macOS 27.0 · **release b782** (official `SwiftLM-b782-macos-arm64.tar.gz`) · `scripts/profiling/m6_bench.py` · runs=3 (1 at 32K+) · warmup=1 · gen=128 · temperature 0 · medians
+
+`SSD` = `--stream-experts` (b769 and b773 crash in this mode). 32K was not re-run; on the fix build it swapped (see below).
+
+| Config | Context (prompt tok) | Prefill tok/s | TTFT s | Decode tok/s | Peak GPU GB | Swap Δ GB | Min free % | Checks |
+|---|---|---|---|---|---|---|---|---|
+| SSD | 512 (533) | 202.4 | 2.65 | 9.67 | 6.53 | 0.0 | 73 | ok |
+| SSD | 8192 (9546) | 285.7 | 33.5 | 8.49 | 7.11 | 0.0 | 71 | ok |
+
+---
+
+#### Earlier build (before b782)
 
 Apple M6 · 32 GB · runs=3 (long=1) · warmup=1 · gen=128 · temperature 0 · medians
 
