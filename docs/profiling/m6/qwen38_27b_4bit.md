@@ -1,4 +1,17 @@
-### `mlx-community/Qwen3.8-27B-4bit`
+### `mlx-community/Qwen3.8-27B-4bit` — release b782
+
+Apple M6 · 32 GB · macOS 27.0 · **release b782** (official `SwiftLM-b782-macos-arm64.tar.gz`) · `scripts/profiling/m6_bench.py` · runs=3 (1 at 32K+) · warmup=1 · gen=128 · temperature 0 · medians
+
+Only 548 and 9.8K tokens were re-run on b782. Process RAM at 9.8K was 16.1–16.7 GB (server log).
+
+| Config | Context (prompt tok) | Prefill tok/s | TTFT s | Decode tok/s | Peak GPU GB | Swap Δ GB | Min free % | Checks |
+|---|---|---|---|---|---|---|---|---|
+| Vanilla | 512 (548) | 234.3 | 2.38 | 9.51 | 15.37 | 0.0 | 41 | ok |
+| Vanilla | 8192 (9815) | 264.4 | 37.21 | 9.16 | 16.08 | 0.0 | 39 | ok |
+
+---
+
+#### Earlier build (before b782)
 
 > **Correction (Sep 24):** the `TurboKV` rows below were run with `--ctx-size`, which on mlx-swift-lm 460ff81 gives the attention layers a `RotatingKVCache`, and `--turbo-kv` only applies to `KVCacheSimple`. So these rows are effectively vanilla, not TurboKV. See #175 for real TurboKV behaviour.
 

@@ -1,5 +1,7 @@
 ### `mlx-community/gemma-4-26b-a4b-it-4bit`
 
+> Measured on an earlier build (before b782).
+
 Apple M6 · 32 GB · runs=3 (long=1) · warmup=1 · gen=128 · temperature 0 · medians
 
 | Config | Context (prompt tok) | Prefill tok/s | TTFT s | Decode tok/s | Peak GPU GB | Swap Δ GB | Min free % | Checks |
