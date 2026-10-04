@@ -629,6 +629,7 @@ curl http://localhost:5413/v1/chat/completions \
 | `--host` | `127.0.0.1` | Host to bind |
 | `--vision` | `false` | Enable VLM (vision-language model) mode for image inputs |
 | `--audio` | `false` | Enable ALM (audio-language model) mode for audio inputs |
+| `--no-vision` | `false` | Load a vision-capable checkpoint as a text-only LLM, skipping VLM auto-detection. Text-only workloads (coding agents) then get the prompt cache, which is still skipped for most VLM-loaded models (Gemma 4 text-only requests are already cached, so the flag is unnecessary there). Mutually exclusive with `--vision` |
 | `--max-tokens` | `2048` | Max tokens limit per generation |
 | `--prefill-size`| `512`  | Prompt prefill chunk size (micro-batching for long contexts) |
 | `--top-p` | `1.0` | Default top-p nucleus sampling (overridable per-request) |

@@ -567,6 +567,9 @@ struct MLXServer: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable VLM (vision-language model) mode for image inputs")
     var vision: Bool = false
 
+    @Flag(name: .long, help: "Load a vision-capable checkpoint as a text-only LLM, skipping VLM auto-detection. Text-only workloads then get the prompt cache, which is still skipped for most VLM-loaded models (Gemma 4 text-only requests are cached)")
+    var noVision: Bool = false
+
     @Flag(name: .long, help: "Enable ALM (audio-language model) mode for audio inputs")
     var audio: Bool = false
 
@@ -620,6 +623,12 @@ struct MLXServer: AsyncParsableCommand {
 
     @Option(name: .long, help: "Assistant checkpoint providing MTP heads, for model families that ship them separately instead of in the main checkpoint (Gemma 4). Ignored when the main model carries its own MTP heads (Qwen3.5, DeepSeek V4).")
     var mtpAssistantModel: String?
+
+    func validate() throws {
+        if vision && noVision {
+            throw ValidationError("--vision and --no-vision are mutually exclusive.")
+        }
+    }
 
     /// Entry point. Delegates to `runInner`, then — on any thrown error, at any
     /// stage — self-reports it as an `exiting` event before rethrowing, so
@@ -981,11 +990,15 @@ struct MLXServer: AsyncParsableCommand {
         // speculative-decoding suite. --vision remains a valid explicit override.
         let speculativeDecodingRequested = self.draftModel != nil || self.dflash || self.mtp
         let autoDetectedVision = !self.audio && architecture.supportsVision
-            && !speculativeDecodingRequested
+            && !speculativeDecodingRequested && !self.noVision
         var isVision = self.vision || autoDetectedVision
         if architecture.supportsVision, !self.vision, !self.audio, speculativeDecodingRequested {
             print(
                 "[SwiftLM] Note: \(architecture.modelType ?? "unknown") reports vision support, but speculative/MTP decoding was requested; loading as a text-only LLM."
+            )
+        } else if architecture.supportsVision, !self.audio, self.noVision {
+            print(
+                "[SwiftLM] Note: \(architecture.modelType ?? "unknown") reports vision support, but --no-vision was given; loading as a text-only LLM."
             )
         } else if autoDetectedVision {
             print(
