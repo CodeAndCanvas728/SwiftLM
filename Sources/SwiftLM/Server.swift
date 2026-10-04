@@ -555,6 +555,9 @@ struct MLXServer: AsyncParsableCommand {
     @Option(name: .long, help: "Number of parallel request slots")
     var parallel: Int = 1
 
+    @Option(name: .long, help: "Reject prompts longer than this many tokens with an OpenAI-style 400 (context_length_exceeded) before prefill. Default: no limit")
+    var maxPromptTokens: Int?
+
     @Flag(name: .long, help: "Enable thinking/reasoning mode (Qwen3.5 etc). Default: disabled")
     var thinking: Bool = false
 
@@ -1355,6 +1358,7 @@ struct MLXServer: AsyncParsableCommand {
             minP: self.minP,
             repeatPenalty: self.repeatPenalty,
             thinking: self.thinking,
+            maxPromptTokens: self.maxPromptTokens,
             isVision: loadedAsVision,
             prefillSize: self.prefillSize,
             turboKV: self.turboKV,
@@ -1648,6 +1652,8 @@ struct ServerConfig: Sendable {
     let minP: Float?
     let repeatPenalty: Float?
     let thinking: Bool
+    /// `--max-prompt-tokens`: longer prompts are rejected before prefill. nil = no limit.
+    let maxPromptTokens: Int?
     let isVision: Bool
     let prefillSize: Int
     /// When true, each KVCacheSimple layer compresses history > 8192 tokens to 3-bit PolarQuant.
@@ -2095,6 +2101,11 @@ func handleChatCompletion(
 
     // ── Prompt caching: full token sequence for prefix matching ──
     let promptTokenCount = lmInput.text.tokens.size
+    if let rejection = await rejectLongPrompt(
+        promptTokens: promptTokenCount, limit: config.maxPromptTokens, slot: slot, stats: stats)
+    {
+        return rejection
+    }
     let promptTokens = lmInput.text.tokens.asArray(Int.self)
 
     // ── Issue #108: does the template leave the thinking block open? ──
@@ -3106,6 +3117,11 @@ func handleTextCompletion(
 
     // ── Get actual prompt token count before generate() to avoid data race ──
     let promptTokenCount = lmInput.text.tokens.size
+    if let rejection = await rejectLongPrompt(
+        promptTokens: promptTokenCount, limit: config.maxPromptTokens, slot: slot, stats: stats)
+    {
+        return rejection
+    }
 
     let modelId = config.modelId
 
@@ -3573,6 +3589,26 @@ func sseHeaders() -> HTTPFields {
         HTTPField(name: .cacheControl, value: "no-cache"),
         HTTPField(name: HTTPField.Name("X-Accel-Buffering")!, value: "no"),
     ])
+}
+
+/// OpenAI-shaped `context_length_exceeded` body when `promptTokens` is over the
+/// `--max-prompt-tokens` limit, else nil (always nil when no limit is set).
+///
+/// It uses OpenAI's wording and code so agent clients recognise it and compact
+/// their history instead of retrying the same prompt.
+func promptTooLongBody(promptTokens: Int, limit: Int?) -> String? {
+    guard let limit, promptTokens > limit else { return nil }
+    return "{\"error\":{\"message\":\"This model's maximum context length is \(limit) tokens. However, your messages resulted in \(promptTokens) tokens.\",\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}"
+}
+
+/// Releases the slot and returns a 400 when the prompt is over `--max-prompt-tokens`,
+/// else nil. Runs before prefill, so a rejected prompt costs no GPU work.
+func rejectLongPrompt(promptTokens: Int, limit: Int?, slot: GenerationSlot, stats: ServerStats) async -> Response? {
+    guard let limit, let body = promptTooLongBody(promptTokens: promptTokens, limit: limit) else { return nil }
+    print("srv  slot_reject: id 0 | prompt=\(promptTokens)t exceeds max_prompt_tokens=\(limit)")
+    slot.release()
+    await stats.requestFinished(tokens: 0, duration: 0)
+    return Response(status: .badRequest, headers: jsonHeaders(), body: .init(byteBuffer: ByteBuffer(string: body)))
 }
 
 /// Build an OpenAI-style `{"error":{...}}` body for a server error. The message
