@@ -641,6 +641,7 @@ curl http://localhost:5413/v1/chat/completions \
 | `--num-draft-tokens` | `4` | Tokens per speculation round. Auto-capped to 1 when combined with `--stream-experts`. |
 | `--dflash` | `false` | Enable DFlash block-diffusion speculative decoding. Requires a compatible DFlash draft model |
 | `--dflash-block-size`| (auto) | Number of tokens per DFlash draft block. Defaults to draft model config |
+| `--max-prompt-tokens` | (none) | Reject prompts longer than this many tokens with an OpenAI-style 400 (`context_length_exceeded`) before prefill, so agent clients compact instead of waiting on a prefill the machine can't hold. Independent of `--ctx-size` |
 | `--no-token-echo` | `false` | Stop echoing generated tokens to stdout as they stream. Request log lines (`srv ...`) are unaffected |
 
 ## 🔧 Per-Request API Parameters
