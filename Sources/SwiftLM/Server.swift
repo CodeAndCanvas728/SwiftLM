@@ -1948,10 +1948,17 @@ actor PromptCache {
 /// The generation prompt after it (`assistant\n<think>…`) is not always a prefix of
 /// its own re-rendered form. Returns nil when the model is not hybrid, the template is
 /// not ChatML, or there is no history to cache.
+///
+/// The attention layers may be KVCacheSimple or, under `--ctx-size`, RotatingKVCache.
+/// A ring is safe here even once it has wrapped: this path never trims, it restores the
+/// exact snapshot taken at the boundary, and the ring's state + metaState round-trip it.
 func hybridCacheBoundary(promptTokens: [Int], imStartId: Int?, cache: [KVCache]) -> Int? {
     guard let imStartId,
           cache.contains(where: { $0 is MambaCache }),
-          cache.allSatisfy({ $0 is MambaCache || type(of: $0) == KVCacheSimple.self }),
+          cache.allSatisfy({
+              $0 is MambaCache || type(of: $0) == KVCacheSimple.self
+                  || type(of: $0) == RotatingKVCache.self
+          }),
           let boundary = promptTokens.lastIndex(of: imStartId), boundary > 0
     else { return nil }
     return boundary
@@ -2294,7 +2301,9 @@ func handleChatCompletion(
 
         // ── Hybrid (recurrent + attention) prompt cache ──
         // Qwen3.5/3.6-style models pair MambaCache (linear attention) with KVCacheSimple
-        // layers, and the generic path below refuses them: recurrent state cannot be
+        // layers (RotatingKVCache under --ctx-size; this path must run before the
+        // sliding-window one, which misses on any MambaCache), and the generic path below
+        // refuses them: recurrent state cannot be
         // trimmed, and the onPrefillDone save runs after the first decode token has been
         // fed. Without this, every agent turn re-prefills the whole conversation. Instead:
         // resume from an exact cached prefix, prefill to the turn boundary, snapshot there

@@ -77,4 +77,57 @@ final class HybridPromptCacheTests: XCTestCase {
                                             into: [KVCacheSimple(), MambaCache()])
         XCTAssertNil(n, "only the boundary snapshot may persist recurrent state")
     }
+
+    // MARK: - --ctx-size: RotatingKVCache attention layers
+
+    /// A ring fed `n` single tokens; values encode the token index.
+    private func makeRing(maxSize: Int, tokens n: Int) -> RotatingKVCache {
+        let ring = RotatingKVCache(maxSize: maxSize, keep: 0, step: 4)
+        for t in 0 ..< n {
+            let k = MLXArray([Float(t)]).reshaped([1, 1, 1, 1])
+            _ = ring.update(keys: k, values: k)
+        }
+        return ring
+    }
+
+    private func makeMamba() -> MambaCache {
+        let mamba = MambaCache()
+        mamba.state = [MLXArray.ones([1, 3, 8]), MLXArray.ones([1, 2, 4, 4])]
+        return mamba
+    }
+
+    func testBoundaryAcceptsRotatingAttentionLayers() {
+        let tokens = [imStart, 1, imStart, 2]
+        XCTAssertEqual(hybridCacheBoundary(promptTokens: tokens, imStartId: imStart,
+                                           cache: [RotatingKVCache(maxSize: 16), MambaCache()]), 2,
+                       "--ctx-size must not turn the hybrid cache off")
+    }
+
+    func testRestoresWrappedRingExactly() async {
+        let ring = makeRing(maxSize: 16, tokens: 40)  // wrapped
+        let pc = PromptCache()
+        await pc.save(tokens: Array(0 ..< 40), cache: [ring, makeMamba()], allowRecurrent: true)
+
+        // Decode on the live ring after saving; the snapshot must not see it.
+        for t in 40 ..< 50 {
+            let k = MLXArray([Float(t)]).reshaped([1, 1, 1, 1])
+            _ = ring.update(keys: k, values: k)
+        }
+        let fresh: [any KVCache] = [RotatingKVCache(maxSize: 16), MambaCache()]
+        let n = await pc.restoreExactPrefix(newTokens: Array(0 ..< 40) + [999], limit: 40, into: fresh)
+
+        XCTAssertEqual(n, 40)
+        XCTAssertEqual(fresh[0].offset, 40)
+        XCTAssertEqual(fresh[0].state[0].asArray(Float.self).sorted(), (24 ..< 40).map { Float($0) },
+                       "the restored window is the snapshot's, not the live ring's")
+    }
+
+    func testRotatingHybridMissesWhenPrefixDiverges() async {
+        let pc = PromptCache()
+        await pc.save(tokens: Array(0 ..< 8), cache: [makeRing(maxSize: 16, tokens: 8), makeMamba()],
+                      allowRecurrent: true)
+        let n = await pc.restoreExactPrefix(newTokens: [0, 1, 9, 3, 4, 5, 6, 7, 8], limit: 9,
+                                            into: [RotatingKVCache(maxSize: 16), MambaCache()])
+        XCTAssertNil(n)
+    }
 }
