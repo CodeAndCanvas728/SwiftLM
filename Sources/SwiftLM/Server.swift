@@ -558,6 +558,9 @@ struct MLXServer: AsyncParsableCommand {
     @Option(name: .long, help: "Reject prompts longer than this many tokens with an OpenAI-style 400 (context_length_exceeded) before prefill. Default: no limit")
     var maxPromptTokens: Int?
 
+    @Option(name: .long, help: "Prompt cache entries kept in memory (LRU). More entries let interleaved sessions each keep their prefix, at the cost of one KV copy per entry. Default: 1")
+    var promptCacheEntries: Int = 1
+
     @Flag(name: .long, help: "Enable thinking/reasoning mode (Qwen3.5 etc). Default: disabled")
     var thinking: Bool = false
 
@@ -1375,6 +1378,7 @@ struct MLXServer: AsyncParsableCommand {
             repeatPenalty: self.repeatPenalty,
             thinking: self.thinking,
             maxPromptTokens: self.maxPromptTokens,
+            promptCacheEntries: self.promptCacheEntries,
             tokenEcho: !self.noTokenEcho,
             isVision: loadedAsVision,
             prefillSize: self.prefillSize,
@@ -1486,7 +1490,18 @@ struct MLXServer: AsyncParsableCommand {
         }
 
         // Chat completions — handler extracted to avoid type-checker timeout
-        let promptCache = PromptCache()
+        let promptCache = PromptCache(maxEntries: config.promptCacheEntries)
+        // Cached KV is the largest evictable allocation; give it back before the OS has to
+        // compress or kill. Keep the source for the server's lifetime.
+        let memoryPressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical])
+        memoryPressure.setEventHandler {
+            let critical = memoryPressure.data.contains(.critical)
+            Task {
+                await promptCache.evict(keepMostRecent: !critical)
+                print("[SwiftLM] Memory pressure (\(critical ? "critical" : "warning")): evicted prompt cache entries")
+            }
+        }
+        memoryPressure.resume()
         router.post("/v1/chat/completions") { request, _ -> Response in
             do {
                 let bodyData = try await collectBody(request)
@@ -1671,6 +1686,8 @@ struct ServerConfig: Sendable {
     let thinking: Bool
     /// `--max-prompt-tokens`: longer prompts are rejected before prefill. nil = no limit.
     let maxPromptTokens: Int?
+    /// `--prompt-cache-entries`: LRU capacity of the prompt cache.
+    let promptCacheEntries: Int
     /// Echo each generated chunk to stdout (`--no-token-echo` turns it off).
     let tokenEcho: Bool
     let isVision: Bool
@@ -1802,9 +1819,13 @@ actor PromptCache {
         let metaStates: [[String]]   // Per-layer metadata
     }
 
-    private var cached: CachedState?
+    /// Most recently used first. Holds at most `maxEntries`.
+    private var entries: [CachedState] = []
+    private let maxEntries: Int
     private var hits: Int = 0
     private var misses: Int = 0
+
+    init(maxEntries: Int = 1) { self.maxEntries = max(1, maxEntries) }
 
     /// Save the full prompt token sequence and its KV state.
     /// IMPORTANT: We must eval() the state arrays immediately. The state getter may
@@ -1846,7 +1867,17 @@ actor PromptCache {
         if !allArrays.isEmpty {
             eval(allArrays)
         }
-        cached = CachedState(tokens: tokens, states: states, metaStates: metaStates)
+        // An entry that is a prefix of the new one is dominated by it (a linear conversation
+        // replaces its own previous turn instead of filling the cache).
+        entries.removeAll { tokens.starts(with: $0.tokens) }
+        entries.insert(CachedState(tokens: tokens, states: states, metaStates: metaStates), at: 0)
+        if entries.count > maxEntries { entries.removeLast(entries.count - maxEntries) }
+    }
+
+    /// Drop cached entries under memory pressure: all of them, or all but the most recent.
+    func evict(keepMostRecent: Bool) {
+        let keep = keepMostRecent ? 1 : 0
+        if entries.count > keep { entries.removeLast(entries.count - keep) }
     }
 
     /// Find the longest common prefix between `newTokens` and the cached sequence.
@@ -1861,10 +1892,6 @@ actor PromptCache {
             return nil
         }
 
-        guard let cached, !cached.tokens.isEmpty else {
-            misses += 1
-            return nil
-        }
         // ── Recurrent-layer safety gate ──
         // MambaCache (and other recurrent caches) store a 2-D hidden state with no
         // T dimension, so the dim(2) read below would crash. Hybrid Mamba/attention
@@ -1879,48 +1906,21 @@ actor PromptCache {
             misses += 1
             return nil
         }
-        // Token-by-token longest common prefix scan
-        var matchLen = 0
-        for (a, b) in zip(cached.tokens, newTokens) {
-            guard a == b else { break }
-            matchLen += 1
+        var best: (index: Int, matchLen: Int)?
+        for (i, entry) in entries.enumerated() {
+            if let m = usableMatch(entry, newTokens: newTokens, cache: cache),
+               m > (best?.matchLen ?? 0)
+            {
+                best = (i, m)
+            }
         }
-        guard matchLen > 0 else {
+        guard let (index, matchLen) = best else {
             misses += 1
             return nil
         }
-        // Pre-flight safety check: compute the minimum sequence length across
-        // all cached layers. Sliding-window layers (RotatingKVCache) store far
-        // fewer tokens than the full prompt (e.g. 1440 vs 5537). If the trim
-        // would zero-out any layer, bail BEFORE touching the live cache.
+        let cached = entries.remove(at: index)
+        entries.insert(cached, at: 0)
         let excess = cached.tokens.count - matchLen
-        if excess > 0 {
-            // The state getter stores keys as the first element: [B, H, T, D]
-            // dim(2) = T = the number of cached tokens for that layer.
-            let minCachedSeqLen = cached.states.map { arrays -> Int in
-                guard let firstArray = arrays.first else { return 0 }
-                guard firstArray.ndim >= 3 else { return 0 }
-                return firstArray.dim(2)  // T dimension
-            }.min() ?? 0
-            if excess >= minCachedSeqLen {
-                // Trim would empty or corrupt at least one layer → treat as miss
-                misses += 1
-                return nil
-            }
-        }
-        // A ring buffer that has evicted tokens (offset > maxSize) cannot be rewound by
-        // more than the one slot a full-match replay overwrites: trim(n >= 2) would leave
-        // the window pointing at evicted keys. Treat that as a miss.
-        let replayExtra = matchLen >= newTokens.count ? 1 : 0
-        for i in 0..<min(cache.count, cached.states.count) where cache[i] is RotatingKVCache {
-            let meta = cached.metaStates[i]
-            if meta.count > 3, let maxSize = Int(meta[1]), let offset = Int(meta[3]),
-               offset > maxSize, excess + replayExtra > 1
-            {
-                misses += 1
-                return nil
-            }
-        }
         // Safe to restore: trim won't corrupt any layer. Detach so decode steps on the
         // live cache cannot write through into the saved snapshot.
         for i in 0..<min(cache.count, cached.states.count) {
@@ -1936,16 +1936,63 @@ actor PromptCache {
         return matchLen
     }
 
+    /// Length of the common prefix between `entry` and `newTokens`, or nil when restoring
+    /// that entry into `cache` and trimming the excess would corrupt a layer.
+    private func usableMatch(_ entry: CachedState, newTokens: [Int], cache: [KVCache]) -> Int? {
+        guard !entry.tokens.isEmpty else { return nil }
+        var matchLen = 0
+        for (a, b) in zip(entry.tokens, newTokens) {
+            guard a == b else { break }
+            matchLen += 1
+        }
+        guard matchLen > 0 else { return nil }
+        // Pre-flight safety check: compute the minimum sequence length across
+        // all cached layers. Sliding-window layers (RotatingKVCache) store far
+        // fewer tokens than the full prompt (e.g. 1440 vs 5537). If the trim
+        // would zero-out any layer, bail BEFORE touching the live cache.
+        let excess = entry.tokens.count - matchLen
+        if excess > 0 {
+            // The state getter stores keys as the first element: [B, H, T, D]
+            // dim(2) = T = the number of cached tokens for that layer.
+            let minCachedSeqLen = entry.states.map { arrays -> Int in
+                guard let firstArray = arrays.first, firstArray.ndim >= 3 else { return 0 }
+                return firstArray.dim(2)
+            }.min() ?? 0
+            if excess >= minCachedSeqLen { return nil }
+        }
+        // A ring buffer that has evicted tokens (offset > maxSize) cannot be rewound by
+        // more than the one slot a full-match replay overwrites: trim(n >= 2) would leave
+        // the window pointing at evicted keys. Treat that as a miss.
+        let replayExtra = matchLen >= newTokens.count ? 1 : 0
+        for i in 0..<min(cache.count, entry.states.count) where cache[i] is RotatingKVCache {
+            let meta = entry.metaStates[i]
+            if meta.count > 3, let maxSize = Int(meta[1]), let offset = Int(meta[3]),
+               offset > maxSize, excess + replayExtra > 1
+            {
+                return nil
+            }
+        }
+        return matchLen
+    }
+
     /// Hybrid-model restore. Recurrent state cannot be trimmed, only resumed, so the
     /// cached sequence is reusable only if it is an exact prefix of `newTokens` no longer
     /// than `limit`. Returns the cached length (tokens now in `cache`), or nil on a miss.
     func restoreExactPrefix(newTokens: [Int], limit: Int, into cache: [KVCache]) -> Int? {
-        guard let cached, !cached.tokens.isEmpty, cached.tokens.count <= limit,
-              cached.states.count == cache.count, newTokens.starts(with: cached.tokens)
+        // Longest exact-prefix entry wins.
+        guard let index = entries.indices
+            .filter({ i in
+                let e = entries[i]
+                return !e.tokens.isEmpty && e.tokens.count <= limit
+                    && e.states.count == cache.count && newTokens.starts(with: e.tokens)
+            })
+            .max(by: { entries[$0].tokens.count < entries[$1].tokens.count })
         else {
             misses += 1
             return nil
         }
+        let cached = entries.remove(at: index)
+        entries.insert(cached, at: 0)
         for (i, layer) in cache.enumerated() {
             var layer = layer
             layer.state = cached.states[i].map(detachedArray)
