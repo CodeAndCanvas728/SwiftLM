@@ -561,6 +561,9 @@ struct MLXServer: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable thinking/reasoning mode (Qwen3.5 etc). Default: disabled")
     var thinking: Bool = false
 
+    @Flag(name: .long, help: "Do not echo generated tokens to stdout as they stream. Request log lines are unaffected.")
+    var noTokenEcho: Bool = false
+
     @Flag(name: .long, help: "Enable VLM (vision-language model) mode for image inputs")
     var vision: Bool = false
 
@@ -1061,7 +1064,7 @@ struct MLXServer: AsyncParsableCommand {
         // Final after the VLM→LLM fallback above; later closures capture this `let`.
         let loadedAsVision = isVision
         if loadedAsVision || isAudio {
-            print("[SwiftLM] Note: the prompt cache is not used for VLM/Omni loads; each text request re-prefills its full prompt.")
+            print("[SwiftLM] Note: the prompt cache is only used for text requests on Gemma 4 VLM/Omni loads; other VLM/Omni models re-prefill each text prompt in full.")
         }
 
         tracker.finish()
@@ -1359,6 +1362,7 @@ struct MLXServer: AsyncParsableCommand {
             repeatPenalty: self.repeatPenalty,
             thinking: self.thinking,
             maxPromptTokens: self.maxPromptTokens,
+            tokenEcho: !self.noTokenEcho,
             isVision: loadedAsVision,
             prefillSize: self.prefillSize,
             turboKV: self.turboKV,
@@ -1654,6 +1658,8 @@ struct ServerConfig: Sendable {
     let thinking: Bool
     /// `--max-prompt-tokens`: longer prompts are rejected before prefill. nil = no limit.
     let maxPromptTokens: Int?
+    /// Echo each generated chunk to stdout (`--no-token-echo` turns it off).
+    let tokenEcho: Bool
     let isVision: Bool
     let prefillSize: Int
     /// When true, each KVCacheSimple layer compresses history > 8192 tokens to 3-bit PolarQuant.
@@ -1814,10 +1820,12 @@ actor PromptCache {
                     guard arr.ndim >= 3 else { return arr }
                     let T = arr.dim(2)
                     if T > P { return arr[.ellipsis, ..<P, 0...] }
-                    return arr
+                    return detachedArray(arr)
                 }
             }
-            return s
+            // RotatingKVCache hands out its live ring buffers, which later decode steps
+            // overwrite in place; snapshot them.
+            return s.map(detachedArray)
         }
         let metaStates = cache.map { $0.metaState }
         // Materialize all lazy MLX arrays so they survive cache mutations
@@ -1887,10 +1895,24 @@ actor PromptCache {
                 return nil
             }
         }
-        // Safe to restore: trim won't corrupt any layer
+        // A ring buffer that has evicted tokens (offset > maxSize) cannot be rewound by
+        // more than the one slot a full-match replay overwrites: trim(n >= 2) would leave
+        // the window pointing at evicted keys. Treat that as a miss.
+        let replayExtra = matchLen >= newTokens.count ? 1 : 0
+        for i in 0..<min(cache.count, cached.states.count) where cache[i] is RotatingKVCache {
+            let meta = cached.metaStates[i]
+            if meta.count > 3, let maxSize = Int(meta[1]), let offset = Int(meta[3]),
+               offset > maxSize, excess + replayExtra > 1
+            {
+                misses += 1
+                return nil
+            }
+        }
+        // Safe to restore: trim won't corrupt any layer. Detach so decode steps on the
+        // live cache cannot write through into the saved snapshot.
         for i in 0..<min(cache.count, cached.states.count) {
             var layer = cache[i]
-            layer.state = cached.states[i]
+            layer.state = cached.states[i].map(detachedArray)
             layer.metaState = cached.metaStates[i]
         }
         if excess > 0 {
@@ -1913,7 +1935,7 @@ actor PromptCache {
         }
         for (i, layer) in cache.enumerated() {
             var layer = layer
-            layer.state = cached.states[i]
+            layer.state = cached.states[i].map(detachedArray)
             // ArraysCache's metaState setter traps; it carries no metadata to restore.
             if !(layer is MambaCache) { layer.metaState = cached.metaStates[i] }
         }
@@ -1939,6 +1961,41 @@ func hybridCacheBoundary(promptTokens: [Int], imStartId: Int?, cache: [KVCache])
           let boundary = promptTokens.lastIndex(of: imStartId), boundary > 0
     else { return nil }
     return boundary
+}
+
+/// Copy-on-write snapshot of a cache state array. RotatingKVCache (and the KVCacheSimple
+/// setter) update their buffers in place, which would otherwise write through into a
+/// saved or restored snapshot that shares them.
+func detachedArray(_ a: MLXArray) -> MLXArray {
+    a.ndim == 0 ? a : a[0...]
+}
+
+/// Slice `text` along the sequence axis, keeping its rank and slicing the mask with it.
+/// VLM processors return `[1, T]` tokens, where an axis-0 slice would cut the batch axis.
+func sliceText(_ text: LMInput.Text, from start: Int, to end: Int? = nil) -> LMInput.Text {
+    let stop = end ?? text.tokens.dim(-1)
+    return text.tokens.ndim >= 2 ? text[0..., start ..< stop] : text[start ..< stop]
+}
+
+/// Whether the prompt cache must be bypassed for a request.
+///
+/// VLM/Omni loads are skipped except for models whose text-only path is stateless: the
+/// Qwen-VL family needs the LMOutput.State (ropeDeltas) of the cached prefix, which the
+/// cache does not store.
+func shouldSkipPromptCache(
+    isMultimodalRequest: Bool, kvBitsSet: Bool, isVLM: Bool, vlmTextCacheSafe: Bool
+) -> Bool {
+    isMultimodalRequest || kvBitsSet || (isVLM && !vlmTextCacheSafe)
+}
+
+/// Where a cache containing sliding-window (RotatingKVCache) layers may snapshot: the
+/// start of the turn being generated (last `<|turn>` / `<|im_start|>`), else the end of
+/// the prompt. Ring buffers have to be saved synchronously at a known length — after the
+/// first decode token the window has already moved on.
+func rotatingCacheBoundary(promptTokens: [Int], turnStartIds: [Int?]) -> Int {
+    let ids = Set(turnStartIds.compactMap { $0 })
+    if let b = promptTokens.lastIndex(where: { ids.contains($0) }), b > 0 { return b }
+    return promptTokens.count
 }
 
 // ── Request Body Extraction ──────────────────────────────────────────────────
@@ -2223,7 +2280,7 @@ func handleChatCompletion(
         // requests (image/audio), prepare() must inject the vision/audio feature embeddings
         // before the language model runs. A cache hit would skip that injection, feeding
         // raw <|image|>/<|audio|> token embeddings instead of the projected features.
-        let isMultimodalRequest = lmInput.image != nil || lmInput.audio != nil
+        let isMultimodalRequest = lmInput.image != nil || lmInput.video != nil || lmInput.audio != nil
 
         // ── Decision branch ──
         // Speculative decoding is CHECKED FIRST because a cache-hit rollback
@@ -2234,14 +2291,17 @@ func handleChatCompletion(
         // produced with KVCacheSimple; restoring it into a QuantizedKVCache (or vice-versa)
         // is unsafe and produces incorrect results or runtime failures.
         //
-        // Skip it for VLM/Omni-loaded models too. Their processors mostly return [1, T]
-        // tokens, which the axis-0 slices below mishandle (a generic hit re-feeds the whole
-        // prompt on top of the restored KV), and models such as Qwen3.5/Qwen3-VL need the
-        // LMOutput.State (ropeDeltas) of the cached prefix, which the prompt cache does not
-        // store. Checked on the model type rather than config.isVision so --audio
+        // Skip it for VLM/Omni-loaded models too, except Gemma 4: models such as
+        // Qwen3.5/Qwen3-VL need the LMOutput.State (ropeDeltas) of the cached prefix, which
+        // the prompt cache does not store, whereas Gemma 4's text-only path is stateless.
+        // Checked on the model type rather than config.isVision so --audio
         // (OmniModelFactory) loads are covered as well.
         let isVLM = context.model is any VLMModel
-        let skipPromptCache = isMultimodalRequest || params.kvBits != nil || isVLM
+        let vlmTextCacheSafe = context.model is MLXVLM.Gemma4 && !config.mtp && mtpAssistant == nil
+        let skipPromptCache = shouldSkipPromptCache(
+            isMultimodalRequest: isMultimodalRequest, kvBitsSet: params.kvBits != nil,
+            isVLM: isVLM, vlmTextCacheSafe: vlmTextCacheSafe)
+        let promptLength = promptTokens.count
 
         // ── Hybrid (recurrent + attention) prompt cache ──
         // Qwen3.5/3.6-style models pair MambaCache (linear attention) with KVCacheSimple
@@ -2255,6 +2315,20 @@ func handleChatCompletion(
             : hybridCacheBoundary(
                 promptTokens: promptTokens,
                 imStartId: context.tokenizer.convertTokenToId("<|im_start|>"), cache: cache)
+        // ── Sliding-window (RotatingKVCache) prompt cache ──
+        // Same reasoning as the hybrid path: the late save below runs one decode token after
+        // the prompt, when the ring buffer no longer lines up with `promptTokens`. Snapshot
+        // synchronously at the turn boundary instead.
+        let hasRotatingLayer = cache.contains { $0 is RotatingKVCache }
+        let rotatingBoundary: Int? = (skipPromptCache || hybridBoundary != nil || draftModelRef != nil
+            || config.mtp || config.turboKV || !hasRotatingLayer)
+            ? nil
+            : rotatingCacheBoundary(
+                promptTokens: promptTokens,
+                turnStartIds: [
+                    context.tokenizer.convertTokenToId("<|turn>"),
+                    context.tokenizer.convertTokenToId("<|im_start|>"),
+                ])
         var stream: AsyncStream<Generation>
         if let boundary = hybridBoundary {
             let start = await promptCache.restoreExactPrefix(
@@ -2264,13 +2338,37 @@ func handleChatCompletion(
                 // SSD-streaming error handling as a cold prefill), then samples one token
                 // without feeding it back, so the cache ends at exactly `boundary`.
                 _ = try TokenIterator(
-                    input: LMInput(tokens: lmInput.text.tokens[start..<boundary]),
+                    input: LMInput(text: sliceText(lmInput.text, from: start, to: boundary)),
                     model: context.model, cache: cache, parameters: params)
                 await promptCache.save(
                     tokens: Array(promptTokens[..<boundary]), cache: cache, allowRecurrent: true)
             }
             stream = try MLXLMCommon.generate(
-                input: LMInput(tokens: lmInput.text.tokens[boundary...]),
+                input: LMInput(text: sliceText(lmInput.text, from: boundary)),
+                cache: cache, parameters: params, context: context)
+        } else if let boundary = rotatingBoundary {
+            var start = await promptCache.restore(newTokens: promptTokens, into: cache) ?? 0
+            if start >= promptLength {
+                // Full match: replay the last token to get next-token logits.
+                start = promptLength - 1
+                for layer in cache { layer.trim(1) }
+            }
+            if start < boundary {
+                // TokenIterator.init prefills into `cache` and leaves it at exactly `boundary`.
+                _ = try TokenIterator(
+                    input: LMInput(text: sliceText(lmInput.text, from: start, to: boundary)),
+                    model: context.model, cache: cache, parameters: params)
+                await promptCache.save(tokens: Array(promptTokens[..<boundary]), cache: cache)
+                start = boundary
+            }
+            if start >= promptLength {
+                // The boundary is the end of the prompt; step back one token (exact on a
+                // ring buffer) so there is something to feed.
+                start = promptLength - 1
+                for layer in cache { layer.trim(1) }
+            }
+            stream = try MLXLMCommon.generate(
+                input: LMInput(text: sliceText(lmInput.text, from: start)),
                 cache: cache, parameters: params, context: context)
         } else if let draftRef = draftModelRef {
             // Speculative decoding path: draft model generates candidates, main model verifies.
@@ -2285,15 +2383,14 @@ func handleChatCompletion(
             // Cache hit: KV state is pre-populated up to cachedCount tokens.
             // Only compute the remaining (new) tokens.
             var startIndex = cachedCount
-            if startIndex >= lmInput.text.tokens.count {
+            if startIndex >= promptLength {
                 // Full match: all tokens are cached. We still need to feed at least
                 // the last token so the model can produce next-token logits.
-                startIndex = lmInput.text.tokens.count - 1
+                startIndex = promptLength - 1
                 // Trim the KV cache back by 1 to avoid double-counting the replayed token.
                 for layer in cache { layer.trim(1) }
             }
-            let remainingTokens = lmInput.text.tokens[startIndex...]
-            let trimmedInput = LMInput(tokens: remainingTokens)
+            let trimmedInput = LMInput(text: sliceText(lmInput.text, from: startIndex))
             if config.mtp, let mtpCtx = mtpContext(main: context, assistant: mtpAssistant) {
                 stream = try MLXLMCommon.generateMTP(
                     input: trimmedInput, cache: cache, parameters: params, context: mtpCtx, numMTPTokens: config.numMtpTokens
@@ -2335,9 +2432,12 @@ func handleChatCompletion(
         let onPrefillDone: (() async -> Void)? = {
             // The hybrid path already saved at its boundary; a save here would capture
             // recurrent state one decode token too late.
-            guard hybridBoundary == nil else { return }
+            guard hybridBoundary == nil, rotatingBoundary == nil else { return }
             // Nothing would ever restore it (see skipPromptCache above).
-            guard !isVLM else { return }
+            guard !skipPromptCache else { return }
+            // A ring buffer cannot be snapshotted after the first decode token (the MTP,
+            // draft and TurboKV paths land here with rotating layers).
+            guard !hasRotatingLayer else { return }
             if turboHasCompressed {
                 print("[SwiftLM] 🧠 Skipping prompt cache save — TurboQuant has compressed \(cache.compactMap { ($0 as? KVCacheSimple)?.compressedOffset }.max() ?? 0) tokens. Saving would decode ~37 GB back to fp16.")
             } else if params.kvBits != nil {
@@ -2358,7 +2458,7 @@ func handleChatCompletion(
             startGeneration: startGeneration, modelId: modelId, stopSequences: stopSequences,
             includeUsage: includeUsage, promptTokenCount: promptTokenCount,
             enableThinking: enableThinking, thinkingPreOpened: thinkingPreOpened,
-            jsonMode: jsonMode, slot: slot,
+            jsonMode: jsonMode, tokenEcho: config.tokenEcho, slot: slot,
             stats: stats, genStart: genStart, prefillStart: prefillStart,
             emitPrefillProgress: emitPrefillProgress
         )
@@ -2367,8 +2467,9 @@ func handleChatCompletion(
         return try await handleChatNonStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
             promptTokenCount: promptTokenCount, enableThinking: enableThinking,
-            thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, slot: slot,
-            stats: stats, genStart: genStart, prefillStart: prefillStart, onPrefillDone: onPrefillDone
+            thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, tokenEcho: config.tokenEcho,
+            slot: slot, stats: stats, genStart: genStart, prefillStart: prefillStart,
+            onPrefillDone: onPrefillDone
         )
     }
 }
@@ -2548,6 +2649,7 @@ func handleChatStreaming(
     enableThinking: Bool = false,
     thinkingPreOpened: Bool = false,
     jsonMode: Bool = false,
+    tokenEcho: Bool = true,
     slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date,
@@ -2613,6 +2715,10 @@ func handleChatStreaming(
         // arriving in a later chunk merges with the previous one.
         var emittedTextCount = 0
         var heldStopTail = ""
+        let stopWindow = stopScanWindow(stopSequences)
+        // Characters appended since the last stop scan. Usually one chunk, but JSON-mode
+        // buffering skips the scan for its first chunks, so they must be covered later.
+        var unscannedStopChars = 0
         // Unconditional cleanup: guarantees heartbeat is cancelled and the
         // generation slot is returned on ALL exit paths (normal completion,
         // startGeneration failure, client disconnect, or task cancellation).
@@ -2649,6 +2755,7 @@ func handleChatStreaming(
             case .chunk(let text, _):
                 completionTokenCount += 1
                 fullText += text
+                unscannedStopChars += text.count
                 // GPU yield: prevent Metal from starving macOS WindowServer
                 if completionTokenCount % 8 == 0 {
                     try? await Task.sleep(for: .microseconds(50))
@@ -2668,8 +2775,10 @@ func handleChatStreaming(
                     if let onPrefillDone { await onPrefillDone() }
                     firstToken = false
                 }
-                print(text, terminator: "")
-                fflush(stdout)
+                if tokenEcho {
+                    print(text, terminator: "")
+                    fflush(stdout)
+                }
 
                 // ── JSON mode buffering: accumulate early tokens, strip prefix, then flush ──
                 if jsonBuffering {
@@ -2721,7 +2830,9 @@ func handleChatStreaming(
                 // shows no match and its tail is the opening of one. Emitting that tail
                 // hands the client the very text it asked to be cut (#126), so the
                 // ambiguous suffix is withheld until the next chunk resolves it.
-                let stopHit = checkStopSequences(fullText, stopSequences: stopSequences)
+                let stopHit = checkStopSequences(
+                    fullText, stopSequences: stopSequences, lookback: stopWindow + unscannedStopChars)
+                unscannedStopChars = 0
                 var survivingText: String
                 if let (trimmedFull, _) = stopHit {
                     // The stop completed. Everything the client is owed is the part of
@@ -2756,6 +2867,8 @@ func handleChatStreaming(
                         }
                     }
                     cont.yield(sseChunk(modelId: modelId, reasoningContent: nil, content: nil, finishReason: "stop"))
+                    // Stopping here means `.info` never arrives, so usage is the chunk
+                    // count: a slight undercount if the decoder buffered any tokens.
                     let genDur = Date().timeIntervalSince(genStart)
                     let genTokPerSec = genDur > 0 ? Double(completionTokenCount) / genDur : 0
                     if includeUsage {
@@ -2794,6 +2907,9 @@ func handleChatStreaming(
                 print("[SwiftLM] Rejected tool call: reason=\(rejection.reason) tool=\(rejection.toolName ?? "?") detail=\(rejection.detail ?? "n/a")")
 
             case .info(let info):
+                // The chunk count undercounts: tokens the decoder buffers (tool-call
+                // bodies, partial text) emit no chunk. `info` carries the real count.
+                completionTokenCount = info.generationTokenCount
                 heartbeatTask?.cancel()
                 heartbeatTask = nil
                 activePrefillProgressHook = nil
@@ -2900,6 +3016,7 @@ func handleChatNonStreaming(
     enableThinking: Bool = false,
     thinkingPreOpened: Bool = false,
     jsonMode: Bool = false,
+    tokenEcho: Bool = true,
     slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date,
@@ -2931,8 +3048,10 @@ func handleChatNonStreaming(
                 if let onPrefillDone { await onPrefillDone() }
                 firstToken = false
             }
-            print(text, terminator: "")
-            fflush(stdout)
+            if tokenEcho {
+                print(text, terminator: "")
+                fflush(stdout)
+            }
         case .toolCall(let tc):
             let argsJson = serializeToolCallArgs(tc.function.arguments)
             collectedToolCalls.append(ToolCallResponse(
@@ -2946,6 +3065,7 @@ func handleChatNonStreaming(
             print("[SwiftLM] Rejected tool call: reason=\(rejection.reason) tool=\(rejection.toolName ?? "?") detail=\(rejection.detail ?? "n/a")")
         case .info(let info):
             generationStopReason = info.stopReason
+            completionTokenCount = info.generationTokenCount  // real count; see handleChatStreaming
         }
     }
     print("")  // end the real-time token stream line
@@ -2963,8 +3083,8 @@ func handleChatNonStreaming(
     default:
         finishReason = "stop"
     }
-    if checkStopSequences(fullText, stopSequences: stopSequences) != nil {
-        fullText = checkStopSequences(fullText, stopSequences: stopSequences)!.0
+    if let (trimmedText, _) = checkStopSequences(fullText, stopSequences: stopSequences) {
+        fullText = trimmedText
         finishReason = "stop"
     }
 
@@ -3192,6 +3312,7 @@ func handleTextStreaming(
         // a stop sequence (#133). Local to this loop; the chat path has its own pair.
         var emittedTextCount = 0
         var heldStopTail = ""
+        let stopWindow = stopScanWindow(stopSequences)
         // Unconditional cleanup: cancels the heartbeat and returns the generation
         // slot on ALL exit paths (completion, startGeneration failure, disconnect).
         defer {
@@ -3233,7 +3354,9 @@ func handleTextStreaming(
                 // tail, and track characters actually released rather than deriving a
                 // position from chunk boundaries — that arithmetic was wrong in both
                 // directions on the chat path before it was replaced.
-                if let (trimmedText, _) = checkStopSequences(fullText, stopSequences: stopSequences) {
+                if let (trimmedText, _) = checkStopSequences(
+                    fullText, stopSequences: stopSequences, lookback: stopWindow + text.count
+                ) {
                     let remainder = String(
                         trimmedText.dropFirst(min(emittedTextCount, trimmedText.count)))
                     if !remainder.isEmpty {
@@ -3257,6 +3380,9 @@ func handleTextStreaming(
                 // Text-completion endpoint: tool calling has no wire representation here.
                 break
             case .info(let info):
+                // The chunk count undercounts: tokens the decoder buffers (tool-call
+                // bodies, partial text) emit no chunk. `info` carries the real count.
+                completionTokenCount = info.generationTokenCount
                 heartbeatTask?.cancel()
                 heartbeatTask = nil
                 activePrefillProgressHook = nil
@@ -3319,7 +3445,9 @@ func handleTextNonStreaming(
             if completionTokenCount % 8 == 0 {
                 try? await Task.sleep(for: .microseconds(50))
             }
-        case .toolCall, .rejectedToolCall, .info:
+        case .info(let info):
+            completionTokenCount = info.generationTokenCount  // real count; see handleChatStreaming
+        case .toolCall, .rejectedToolCall:
             break
         }
     }
@@ -3549,16 +3677,33 @@ func mtpContext(main: ModelContext, assistant: (any DualModelMTP)?) -> ModelCont
 /// happened to be listed first kept everything between the real stop and that one, so
 /// `stop: ["\nUser:", "X"]` against `"abXc\nUser:"` streamed `"abXc"` when the client
 /// had asked to stop at `X` (#126).
-func checkStopSequences(_ text: String, stopSequences: [String]) -> (String, String)? {
+///
+/// `lookback` limits the search to the last `lookback` characters. Streaming callers
+/// pass the length of text appended since their last scan plus `stopScanWindow(_:)`:
+/// everything before it was already checked without a match, so a new match must end
+/// inside the new text.
+/// Without it, re-scanning the whole response on every chunk is O(n²). `nil` scans all.
+func checkStopSequences(_ text: String, stopSequences: [String], lookback: Int? = nil) -> (String, String)? {
+    let searchStart = lookback.flatMap {
+        text.index(text.endIndex, offsetBy: -$0, limitedBy: text.startIndex)
+    } ?? text.startIndex
+    let searched = text[searchStart...]
     var earliest: (index: String.Index, stop: String)?
     for stop in stopSequences where !stop.isEmpty {
-        guard let range = text.range(of: stop) else { continue }
+        guard let range = searched.range(of: stop) else { continue }
         if earliest == nil || range.lowerBound < earliest!.index {
             earliest = (range.lowerBound, stop)
         }
     }
     guard let earliest else { return nil }
     return (String(text[text.startIndex..<earliest.index]), earliest.stop)
+}
+
+/// Characters of already-checked text a streaming stop scan must look back over: the
+/// longest stop string, plus one because a chunk can merge with the previous character
+/// into a single grapheme.
+func stopScanWindow(_ stopSequences: [String]) -> Int {
+    (stopSequences.map(\.count).max() ?? 0) + 1
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
