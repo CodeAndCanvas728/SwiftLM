@@ -564,7 +564,7 @@ struct MLXServer: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable VLM (vision-language model) mode for image inputs")
     var vision: Bool = false
 
-    @Flag(name: .long, help: "Load a vision-capable checkpoint as a text-only LLM, skipping VLM auto-detection. Text-only workloads then get the prompt cache, which is skipped for VLM-loaded models")
+    @Flag(name: .long, help: "Load a vision-capable checkpoint as a text-only LLM, skipping VLM auto-detection. Text-only workloads then get the prompt cache, which is still skipped for most VLM-loaded models (Gemma 4 text-only requests are cached)")
     var noVision: Bool = false
 
     @Flag(name: .long, help: "Enable ALM (audio-language model) mode for audio inputs")
@@ -993,7 +993,7 @@ struct MLXServer: AsyncParsableCommand {
             print(
                 "[SwiftLM] Note: \(architecture.modelType ?? "unknown") reports vision support, but speculative/MTP decoding was requested; loading as a text-only LLM."
             )
-        } else if architecture.supportsVision, self.noVision {
+        } else if architecture.supportsVision, !self.audio, self.noVision {
             print(
                 "[SwiftLM] Note: \(architecture.modelType ?? "unknown") reports vision support, but --no-vision was given; loading as a text-only LLM."
             )
