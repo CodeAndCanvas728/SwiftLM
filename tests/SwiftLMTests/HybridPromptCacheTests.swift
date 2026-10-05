@@ -130,4 +130,37 @@ final class HybridPromptCacheTests: XCTestCase {
                                             into: [RotatingKVCache(maxSize: 16), MambaCache()])
         XCTAssertNil(n)
     }
+
+    /// A ring restored from a wrapped snapshot must keep behaving exactly like the
+    /// uninterrupted live ring: same offset, metaState and window after further prefill
+    /// chunks and decode steps (with and without a `keep` prefix).
+    func testRestoredWrappedRingContinuesLikeLiveRing() async {
+        for keep in [0, 2] {
+            let live = RotatingKVCache(maxSize: 16, keep: keep, step: 4)
+            for t in 0 ..< 40 {
+                let k = MLXArray([Float(t)]).reshaped([1, 1, 1, 1])
+                _ = live.update(keys: k, values: k)
+            }
+            let pc = PromptCache()
+            await pc.save(tokens: Array(0 ..< 40), cache: [live, makeMamba()], allowRecurrent: true)
+
+            let restored = RotatingKVCache(maxSize: 16, keep: keep, step: 4)
+            let n = await pc.restoreExactPrefix(newTokens: Array(0 ..< 40) + [999], limit: 40,
+                                                into: [restored, MambaCache()])
+            XCTAssertEqual(n, 40)
+
+            for ring in [live, restored] {
+                let chunk = MLXArray((100 ..< 105).map { Float($0) }).reshaped([1, 1, 5, 1])
+                _ = ring.update(keys: chunk, values: chunk)
+                for t in 200 ..< 206 {
+                    let k = MLXArray([Float(t)]).reshaped([1, 1, 1, 1])
+                    _ = ring.update(keys: k, values: k)
+                }
+            }
+            XCTAssertEqual(restored.offset, live.offset, "keep=\(keep)")
+            XCTAssertEqual(restored.metaState, live.metaState, "keep=\(keep)")
+            XCTAssertEqual(restored.state[0].asArray(Float.self), live.state[0].asArray(Float.self),
+                           "keep=\(keep)")
+        }
+    }
 }
