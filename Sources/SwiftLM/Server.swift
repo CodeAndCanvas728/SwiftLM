@@ -558,7 +558,7 @@ struct MLXServer: AsyncParsableCommand {
     @Option(name: .long, help: "Reject prompts longer than this many tokens with an OpenAI-style 400 (context_length_exceeded) before prefill. Default: no limit")
     var maxPromptTokens: Int?
 
-    @Option(name: .long, help: "Prompt cache entries kept in memory (LRU). More entries let interleaved sessions each keep their prefix, at the cost of one KV copy per entry. Default: 1")
+    @Option(name: .long, help: "Prompt cache entries kept in memory (LRU; values below 1 are raised to 1). More entries let interleaved sessions each keep their prefix, at the cost of one KV copy per entry. Under memory pressure the cache keeps only its most recent entry (warning) or is emptied (critical)")
     var promptCacheEntries: Int = 1
 
     @Flag(name: .long, help: "Enable thinking/reasoning mode (Qwen3.5 etc). Default: disabled")
@@ -676,6 +676,11 @@ struct MLXServer: AsyncParsableCommand {
 
         if self.mtp {
             setenv("SWIFTLM_MTP_ENABLE", "1", 1)
+        }
+
+        if self.promptCacheEntries < 1 {
+            print("[SwiftLM] Warning: --prompt-cache-entries must be at least 1, got \(self.promptCacheEntries). Using 1.")
+            self.promptCacheEntries = 1
         }
 
         // Register SwiftLM-owned DFlash model types before any model loading.
@@ -1417,7 +1422,7 @@ struct MLXServer: AsyncParsableCommand {
         let ssdStr = self.streamExperts ? "enabled" : "disabled"
         let turboKVStr = config.turboKV ? "enabled" : "disabled"
         let mtpStr = config.mtp ? "enabled (\(config.numMtpTokens) tokens/round)" : "disabled"
-        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), mtp=\(mtpStr)")
+        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), mtp=\(mtpStr), prompt_cache_entries=\(config.promptCacheEntries)")
         if config.turboKV, let ctx = config.ctxSize {
             print("[SwiftLM] ⚠️  --turbo-kv has no effect with --ctx-size \(ctx): a bounded context gives the attention layers a RotatingKVCache, and TurboKV only compresses KVCacheSimple. Drop --ctx-size to use --turbo-kv.")
         }
@@ -1492,13 +1497,23 @@ struct MLXServer: AsyncParsableCommand {
         // Chat completions — handler extracted to avoid type-checker timeout
         let promptCache = PromptCache(maxEntries: config.promptCacheEntries)
         // Cached KV is the largest evictable allocation; give it back before the OS has to
-        // compress or kill. Keep the source for the server's lifetime.
+        // compress or kill. A warning drops every entry but the most recent one (the live
+        // conversation), so with the default --prompt-cache-entries 1 it drops nothing; a
+        // critical event drops all of them, including that last one. Keep the source for
+        // the server's lifetime.
         let memoryPressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical])
         memoryPressure.setEventHandler {
             let critical = memoryPressure.data.contains(.critical)
             Task {
-                await promptCache.evict(keepMostRecent: !critical)
-                print("[SwiftLM] Memory pressure (\(critical ? "critical" : "warning")): evicted prompt cache entries")
+                let dropped = await promptCache.evict(keepMostRecent: !critical)
+                guard dropped > 0 else { return }
+                // The evicted KV buffers go back to MLX's allocator cache, not to the OS, so
+                // without this the eviction frees almost no memory. Safe while a request is
+                // generating: it only releases buffers the allocator holds unused. It takes
+                // MLX's global eval lock and so may wait for an in-flight eval, which is why
+                // it runs here and not on the GCD handler thread.
+                Memory.clearCache()
+                print("[SwiftLM] Memory pressure (\(critical ? "critical" : "warning")): evicted \(dropped) prompt cache \(dropped == 1 ? "entry" : "entries")")
             }
         }
         memoryPressure.resume()
@@ -1827,6 +1842,81 @@ actor PromptCache {
 
     init(maxEntries: Int = 1) { self.maxEntries = max(1, maxEntries) }
 
+    /// How many trailing tokens of a saved prompt a newer prompt may drop or rewrite and
+    /// still replace it (see `isSuperseded`).
+    ///
+    /// The generic save runs after the first decode token, so the prompt it saves ends with
+    /// the generation prompt (`<|im_start|>assistant\n<think>\n`). Templates that re-render
+    /// history (Qwen3 reasoning templates drop or rewrite it) and edits or regenerations of
+    /// the last message make the next turn diverge from the previous prompt only in its
+    /// last few tokens, so the old prompt is no longer an exact prefix even though it is
+    /// the same conversation. 16 covers those generation prompts with room to spare.
+    ///
+    /// For a cache that can be rewound to any shorter prefix, replacing is bounded: the new
+    /// entry holds the KV for the shared prefix, so any prompt that could have reused the
+    /// old entry loses at most this many tokens of reuse, and the slot goes to something
+    /// else instead of a near-duplicate. A state that cannot be rewound that way (recurrent
+    /// layers, a sliding window that has already dropped tokens) has no such bound and is
+    /// only replaced by an exact extension; `save` picks the rule.
+    static let supersedeSlack = 16
+
+    /// Length of the shared prefix of two token sequences.
+    private static func commonPrefixLength(_ a: [Int], _ b: [Int]) -> Int {
+        var n = 0
+        for (x, y) in zip(a, b) {
+            guard x == y else { break }
+            n += 1
+        }
+        return n
+    }
+
+    /// Whether saving `new` makes the saved `old` redundant.
+    ///
+    /// An exact prefix always does. With `exactPrefixOnly` false (a cache that can be rewound
+    /// to any shorter prefix) so does a near-prefix: `old` diverges from `new` in at most
+    /// `supersedeSlack` trailing tokens, and what it shares with `new` outweighs what it does
+    /// not. The second condition keeps entries that merely start alike apart: a zero-match
+    /// entry is never removable, and a short one (a shared BOS or chat-template header) is
+    /// not replaced by an unrelated prompt just because the whole entry is shorter than the
+    /// slack. Two conversations that share only a system prompt both stay as long as each
+    /// carries more than `supersedeSlack` tokens of its own.
+    ///
+    /// `exactPrefixOnly` is set when the new state cannot stand in for the old one on a
+    /// partial match (see `canRewindToAnyPrefix`): recurrent (hybrid) snapshots are valid
+    /// only at exactly `tokens.count` and consumed by `restoreExactPrefix`, and a wrapped
+    /// ring buffer is rejected by `usableMatch` for any rewind past one token, so for them a
+    /// near-prefix replacement would lose the whole hit, not a few tokens.
+    static func isSuperseded(_ old: [Int], by new: [Int], exactPrefixOnly: Bool) -> Bool {
+        if new.starts(with: old) { return true }
+        if exactPrefixOnly { return false }
+        let shared = commonPrefixLength(old, new)
+        let stale = old.count - shared
+        return stale <= supersedeSlack && shared > stale
+    }
+
+    /// Whether a sliding-window ring buffer has already dropped tokens (offset beyond its
+    /// window). Such a ring can only be rewound by the one slot a full-match replay
+    /// overwrites; anything deeper would leave the window pointing at evicted keys.
+    private static func ringHasDroppedTokens(metaState meta: [String]) -> Bool {
+        // RotatingKVCache.metaState: keep, maxSize, step, offset, idx, ...
+        guard meta.count > 3, let maxSize = Int(meta[1]), let offset = Int(meta[3]) else {
+            return false
+        }
+        return offset > maxSize
+    }
+
+    /// Whether a state saved from `cache` can be restored at any shorter prefix, so that it
+    /// can stand in for a near-prefix entry it replaces: no recurrent layer, and no ring
+    /// buffer that has dropped tokens. This is the same condition `usableMatch` applies when
+    /// restoring.
+    private static func canRewindToAnyPrefix(cache: [KVCache], metaStates: [[String]]) -> Bool {
+        for (layer, meta) in zip(cache, metaStates) {
+            if layer is MambaCache { return false }
+            if layer is RotatingKVCache, ringHasDroppedTokens(metaState: meta) { return false }
+        }
+        return true
+    }
+
     /// Save the full prompt token sequence and its KV state.
     /// IMPORTANT: We must eval() the state arrays immediately. The state getter may
     /// produce lazy computation graphs (e.g. TurboKV decode → reshape → concatenate).
@@ -1841,6 +1931,8 @@ actor PromptCache {
         if !allowRecurrent, cache.contains(where: { $0 is MambaCache }) {
             return
         }
+        // Nothing can restore an empty prompt, and it would only take a slot.
+        guard !tokens.isEmpty else { return }
         let P = tokens.count
         // For attention KVCacheSimple layers, the state tensor is [B, H, T, D] with a
         // pre-allocated T that can exceed the actual prompt length P. If we store the
@@ -1867,20 +1959,30 @@ actor PromptCache {
         if !allArrays.isEmpty {
             eval(allArrays)
         }
-        // An entry that is a prefix of the new one is dominated by it (a linear conversation
-        // replaces its own previous turn instead of filling the cache).
-        entries.removeAll { tokens.starts(with: $0.tokens) }
+        // An entry the new one dominates goes: a conversation replaces its own previous turn
+        // instead of filling the cache. Entries are homogeneous within a run (the generic
+        // path refuses recurrent layers), so the new state's kind also describes the entries
+        // being compared. The near-prefix rule needs a state that restores at any prefix.
+        let exactPrefixOnly = allowRecurrent
+            || !Self.canRewindToAnyPrefix(cache: cache, metaStates: metaStates)
+        entries.removeAll {
+            Self.isSuperseded($0.tokens, by: tokens, exactPrefixOnly: exactPrefixOnly)
+        }
         entries.insert(CachedState(tokens: tokens, states: states, metaStates: metaStates), at: 0)
         if entries.count > maxEntries { entries.removeLast(entries.count - maxEntries) }
     }
 
     /// Drop cached entries under memory pressure: all of them, or all but the most recent.
-    func evict(keepMostRecent: Bool) {
+    /// Returns how many entries were dropped.
+    @discardableResult
+    func evict(keepMostRecent: Bool) -> Int {
         let keep = keepMostRecent ? 1 : 0
-        if entries.count > keep { entries.removeLast(entries.count - keep) }
+        let dropped = max(0, entries.count - keep)
+        if dropped > 0 { entries.removeLast(dropped) }
+        return dropped
     }
 
-    /// Find the longest common prefix between `newTokens` and the cached sequence.
+    /// Find the cached entry with the longest usable common prefix with `newTokens`.
     /// Restores matched KV state, trims any excess — mirrors llama-server behaviour.
     /// Returns the number of matched tokens, or nil on a complete miss.
     func restore(newTokens: [Int], into cache: [KVCache]) -> Int? {
@@ -1940,11 +2042,7 @@ actor PromptCache {
     /// that entry into `cache` and trimming the excess would corrupt a layer.
     private func usableMatch(_ entry: CachedState, newTokens: [Int], cache: [KVCache]) -> Int? {
         guard !entry.tokens.isEmpty else { return nil }
-        var matchLen = 0
-        for (a, b) in zip(entry.tokens, newTokens) {
-            guard a == b else { break }
-            matchLen += 1
-        }
+        let matchLen = Self.commonPrefixLength(entry.tokens, newTokens)
         guard matchLen > 0 else { return nil }
         // Pre-flight safety check: compute the minimum sequence length across
         // all cached layers. Sliding-window layers (RotatingKVCache) store far
@@ -1965,19 +2063,17 @@ actor PromptCache {
         // the window pointing at evicted keys. Treat that as a miss.
         let replayExtra = matchLen >= newTokens.count ? 1 : 0
         for i in 0..<min(cache.count, entry.states.count) where cache[i] is RotatingKVCache {
-            let meta = entry.metaStates[i]
-            if meta.count > 3, let maxSize = Int(meta[1]), let offset = Int(meta[3]),
-               offset > maxSize, excess + replayExtra > 1
-            {
+            if Self.ringHasDroppedTokens(metaState: entry.metaStates[i]), excess + replayExtra > 1 {
                 return nil
             }
         }
         return matchLen
     }
 
-    /// Hybrid-model restore. Recurrent state cannot be trimmed, only resumed, so the
-    /// cached sequence is reusable only if it is an exact prefix of `newTokens` no longer
-    /// than `limit`. Returns the cached length (tokens now in `cache`), or nil on a miss.
+    /// Hybrid-model restore. Recurrent state cannot be trimmed, only resumed, so a cached
+    /// sequence is reusable only if it is an exact prefix of `newTokens` no longer than
+    /// `limit`; the longest such entry wins. Returns the cached length (tokens now in
+    /// `cache`), or nil on a miss.
     func restoreExactPrefix(newTokens: [Int], limit: Int, into cache: [KVCache]) -> Int? {
         // Longest exact-prefix entry wins.
         guard let index = entries.indices
